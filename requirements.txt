@@ -1,0 +1,16 @@
+# Data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# CLI and utilities
+fire>=0.5.0
+
+# API clients
+openai>=1.0.0
+
+# Configuration management
+python-dotenv>=1.0.0
