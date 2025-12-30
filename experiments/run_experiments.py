@@ -3,7 +3,7 @@
 Automated script to run multiple prompt experiments.
 
 This script automates the loop of:
-1. Build Docker image (once for all experiments)
+1. Prepare Docker image (pull from Docker Hub or use local)
 2. Run parallel experiments (passing prompts as env vars)
 3. Grade rollouts
 
@@ -12,13 +12,28 @@ Usage:
     python run_prompt_experiments.py --config experiment_config.json --experiments baseline powerless
     python run_prompt_experiments.py --config experiment_config.json --initial-state states/ctfish-0003.json
 
+Container Sources:
+    Configure in docker_config section of your config file:
+
+    1. Pull from Docker Hub:
+        "docker_config": {
+            "container_source": "dockerhub",
+            "container_image": "gkroiz/agent-interp-envs:tictactoe-latest"
+        }
+
+    2. Use existing local image (default):
+        "docker_config": {
+            "container_source": "local",
+            "container_image": "my-image:latest"
+        }
+
 State Resumption:
     The --initial-state flag allows resuming experiments from a saved state file.
     This can be specified:
     1. Via command line: --initial-state=path/to/state.json (overrides config)
     2. In run_config: {"run_config": {"initial_state": "path/to/state.json"}}
     3. Per experiment: {"experiments": [{"name": "exp1", "initial_state": "path/to/state.json"}]}
-    
+
     Priority: CLI flag > per-experiment config > run_config
 """
 
@@ -32,6 +47,7 @@ from datetime import datetime
 from pathlib import Path
 
 import fire
+import yaml
 
 
 def log(message: str, level: str = "INFO"):
@@ -90,102 +106,209 @@ def run_command(
 # def restore_player_backup(...) - REMOVED
 
 
-def build_docker_image(
-    tag: str,
-    game: str = "tictactoe",
-    board_size: int = 5,
-    win_length: int = 5,
-    max_depth: int = 0,
-    multi_game: int = 0,
-    hints_enabled: int = 1,
-    good_engine: int = 1,
-    hint_ablation: int = 0,
-    max_retries: int = 3,
-    # Chess-specific parameters
-    chess_max_depth: int = 15,
-    chess_analysis_time: float = 7.5,
-    chess_move_time: float = 1.0,
-    chess_hint_ablation: int = 0,
-) -> None:
-    """Build Docker image with specified configuration
-    
-    Args:
-        tag: Docker image tag
-        game: Game type ('chess' or 'tictactoe')
-        board_size: Board size (tictactoe only)
-        win_length: Win length (tictactoe only)
-        max_depth: Max depth (tictactoe only)
-        multi_game: Multi-game mode (tictactoe only)
-        hints_enabled: Hints enabled (tictactoe only)
-        good_engine: Good engine (tictactoe only)
-        hint_ablation: Use hint ablation mode (tictactoe only)
-        max_retries: Number of retries for transient errors
-        chess_max_depth: Stockfish analysis depth (chess only)
-        chess_analysis_time: Time limit for analysis (chess only)
-        chess_move_time: Time limit for moves (chess only)
-        chess_hint_ablation: Use hint ablation mode for chess (chess only)
-    """
-    log(f"Building Docker image: {tag} (game: {game})")
+def pull_docker_image(image: str, max_retries: int = 3) -> None:
+    """Pull Docker image from registry
 
-    # Select Dockerfile based on game
-    if game == "chess":
-        dockerfile = "Dockerfile.chess"
-        cmd = [
-            "docker",
-            "build",
-            "-f",
-            dockerfile,
-            "-t",
-            tag,
-            f"--build-arg=MAX_DEPTH={chess_max_depth}",
-            f"--build-arg=ANALYSIS_TIME={chess_analysis_time}",
-            f"--build-arg=MOVE_TIME={chess_move_time}",
-            f"--build-arg=HINT_ABLATION={chess_hint_ablation}",
-            ".",
-        ]
-    elif game == "tictactoe":
-        dockerfile = "Dockerfile.tictactoe"
-        cmd = [
-            "docker",
-            "build",
-            "-f",
-            dockerfile,
-            "-t",
-            tag,
-            f"--build-arg=BOARD_SIZE={board_size}",
-            f"--build-arg=WIN_LENGTH={win_length}",
-            f"--build-arg=MAX_DEPTH={max_depth}",
-            f"--build-arg=MULTI_GAME={multi_game}",
-            f"--build-arg=HINTS_ENABLED={hints_enabled}",
-            f"--build-arg=GOOD_ENGINE={good_engine}",
-            f"--build-arg=HINT_ABLATION={hint_ablation}",
-            ".",
-        ]
-    else:
-        raise ValueError(f"Unknown game type: {game}. Must be 'chess' or 'tictactoe'.")
+    Args:
+        image: Docker image to pull (e.g., 'gkroiz/agent-interp-envs:latest')
+        max_retries: Number of retries for transient errors
+    """
+    log(f"Pulling Docker image: {image}")
+
+    cmd = ["docker", "pull", image]
 
     # Retry logic for transient Docker errors
     for attempt in range(1, max_retries + 1):
         try:
             run_command(cmd)
-            log(f"Docker image built successfully: {tag}", "SUCCESS")
+            log(f"Docker image pulled successfully: {image}", "SUCCESS")
             return
         except subprocess.CalledProcessError as e:
             if attempt < max_retries:
-                # Check if it's a credential error (transient)
-                error_msg = (e.stderr or "") + (e.stdout or "")
-                if (
-                    "credentials" in error_msg.lower()
-                    or "authentication" in error_msg.lower()
-                ):
-                    log(
-                        f"Docker credential error on attempt {attempt}/{max_retries}, retrying in 5 seconds...",
-                        "WARNING",
-                    )
-                    time.sleep(5)
-                    continue
-            # Re-raise if we've exhausted retries or it's not a credential error
+                log(
+                    f"Pull failed on attempt {attempt}/{max_retries}, retrying in 5 seconds...",
+                    "WARNING",
+                )
+                time.sleep(5)
+                continue
+            # Re-raise if we've exhausted retries
             raise
+
+
+def verify_local_docker_image(image: str) -> bool:
+    """Verify that a Docker image exists locally
+
+    Args:
+        image: Docker image name/tag to verify
+
+    Returns:
+        True if image exists locally, False otherwise
+    """
+    log(f"Verifying local Docker image: {image}")
+
+    try:
+        result = subprocess.run(
+            ["docker", "images", "-q", image],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        exists = bool(result.stdout.strip())
+        if exists:
+            log(f"Docker image found locally: {image}", "SUCCESS")
+        else:
+            log(f"Docker image not found locally: {image}", "WARNING")
+        return exists
+    except subprocess.CalledProcessError:
+        return False
+
+
+def generate_yaml_config(
+    experiment: dict,
+    run_config: dict,
+    game_config: dict,
+    output_path: Path,
+) -> None:
+    """
+    Generate YAML config file for agent-interp-envs containers
+
+    Args:
+        experiment: Experiment configuration
+        run_config: Run configuration (model, max_steps)
+        game_config: Game configuration
+        output_path: Path to write YAML config
+    """
+    # Get task configuration (from experiment or game_config)
+    task_config = {}
+    if "task" in experiment:
+        task_config = experiment["task"].copy()
+    else:
+        task_config = game_config.copy()
+
+    # Build config structure matching agent-interp-envs format
+    config = {
+        "environment": experiment.get("environment", "tictactoe"),
+        "agent": {
+            "model": run_config.get("model", "openai/gpt-4"),
+            "max_steps": run_config.get("max_steps", 30),
+        },
+        "task": task_config,
+        "prompts": {
+            "system_prompt": "",
+            "user_prompt": "",
+        },
+    }
+
+    # Add experiment-specific agent config if present
+    if "agent" in experiment:
+        config["agent"].update(experiment["agent"])
+
+    # Add prompts from experiment if present
+    if "prompts" in experiment:
+        config["prompts"] = experiment["prompts"]
+
+    # Write YAML config
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def run_docker_container(
+    image_tag: str,
+    output_file: Path,
+    env_vars: dict,
+    config_file: Path = None,
+    state_dir: Path = None,
+    initial_state: str = "",
+) -> subprocess.Popen:
+    """
+    Launch a single Docker container
+
+    Args:
+        image_tag: Docker image to run
+        output_file: Path to write stdout/stderr
+        env_vars: Dictionary of environment variables to pass to container
+        config_file: Path to YAML config file to mount at /opt/config.yaml (optional)
+        state_dir: Directory to mount for state saving (optional)
+        initial_state: Path to initial state file for resumption (optional)
+
+    Returns:
+        Popen process object
+    """
+    # Build docker command
+    docker_args = [
+        "docker", "run",
+        "--rm",
+        # Note: Don't use --user flag for agent-interp-envs containers
+        # They need root access to install packages in entry_point.py
+    ]
+
+    # Read .env file and pass as environment variables
+    env_path = Path(".env")
+    if env_path.exists():
+        # Mount the file for backward compatibility
+        docker_args.extend(["-v", f"{env_path.absolute()}:/app/.env"])
+
+        # Also read and pass as env vars (required for agent-interp-envs)
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if line and not line.startswith('#') and '=' in line:
+                    # Split on first = only
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if value:  # Only add if value is not empty
+                        docker_args.extend(["-e", f"{key}={value}"])
+
+    # Mount config file if provided (for agent-interp-envs containers)
+    if config_file and config_file.exists():
+        docker_args.extend(["-v", f"{config_file.absolute()}:/opt/config.yaml:ro"])
+
+    # Add all environment variables
+    for key, value in env_vars.items():
+        if value is not None:
+            docker_args.extend(["-e", f"{key}={value}"])
+
+    # Handle state directory and initial state
+    if state_dir:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        docker_args.extend([
+            "-v", f"{state_dir.absolute()}:/tmp/states",
+            "-e", "STATE_DIR=/tmp/states"
+        ])
+
+        if initial_state:
+            # Mount initial state file
+            initial_state_path = Path(initial_state).absolute()
+            initial_state_dir = initial_state_path.parent
+            initial_state_basename = initial_state_path.name
+
+            docker_args.extend([
+                "-v", f"{initial_state_dir}:/tmp/initial-state:ro",
+                "-e", f"RESUME_FROM=/tmp/initial-state/{initial_state_basename}"
+            ])
+
+    # Add image tag
+    docker_args.append(image_tag)
+
+    # Open output file
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    outfile = open(output_file, "w")
+
+    # Launch container
+    process = subprocess.Popen(
+        docker_args,
+        stdout=outfile,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    # Store output file handle for cleanup
+    process._output_file = outfile
+
+    return process
 
 
 def run_parallel_experiments(
@@ -199,23 +322,31 @@ def run_parallel_experiments(
     experiment_name: str = "",
     description: str = "",
     full_config: dict = None,
-    base_dir: str = "continued_reasoning_results",
+    base_dir: str = "results",
     initial_state: str = "",
     game: str = "tictactoe",
+    experiment: dict = None,
+    run_config: dict = None,
 ) -> str:
     """
-    Run parallel experiments using run-parallel.sh
+    Run parallel experiments by launching Docker containers directly
 
     Args:
+        image_tag: Docker image tag to run
+        num_replicas: Number of parallel runs
+        model: Model name
+        max_steps: Maximum steps per run
         system_prompt: The system prompt to use
         user_prompt: The user prompt to use
         game_config: Game configuration (win_value, draw_value, etc.)
         experiment_name: Name of the experiment (for saving config)
         description: Description of the experiment (for saving config)
         full_config: Full experiment configuration (for saving config)
-        base_dir: Base directory for storing experiment outputs (default: continued_reasoning_results)
+        base_dir: Base directory for storing experiment outputs (default: results)
         initial_state: Path to state file to resume from (optional)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
+        experiment: Full experiment dict for YAML config generation (optional)
+        run_config: Run configuration for YAML config generation (optional)
 
     Returns:
         Output directory path
@@ -225,132 +356,175 @@ def run_parallel_experiments(
     if game_config is None:
         game_config = {}
 
-    # Update .env with MODEL and MAX_STEPS
-    env_path = Path(".env")
-    if env_path.exists():
-        env_content = env_path.read_text()
-        env_lines = env_content.split("\n")
-
-        # Update MODEL and MAX_STEPS
-        updated = set()
-        for i, line in enumerate(env_lines):
-            if line.startswith("MODEL="):
-                env_lines[i] = f"MODEL={model}"
-                updated.add("MODEL")
-            elif line.startswith("MAX_STEPS="):
-                env_lines[i] = f"MAX_STEPS={max_steps}"
-                updated.add("MAX_STEPS")
-
-        # Add if not present
-        if "MODEL" not in updated:
-            env_lines.append(f"MODEL={model}")
-        if "MAX_STEPS" not in updated:
-            env_lines.append(f"MAX_STEPS={max_steps}")
-
-        env_path.write_text("\n".join(env_lines))
-
-    # Record output directories before running
-    # output_base = Path("rh_gpt5_tests")
-    output_base = Path(base_dir)
-    existing_dirs = set(output_base.iterdir()) if output_base.exists() else set()
-
-    cmd = [
-        "bash",
-        "run-parallel.sh",
-        "-n",
-        str(num_replicas),
-        "-m",
-        model,
-        "-t",
-        image_tag,
-        "--system-prompt",
-        system_prompt,
-        "--user-prompt",
-        user_prompt,
-        "-s",  # Save state
-        "--base-dir",
-        base_dir,
-        "--game",
-        game,
-    ]
-
-    # Add initial state file if provided
+    # Validate initial state file if provided
     if initial_state:
-        # Validate that the file exists
         initial_state_path = Path(initial_state)
         if not initial_state_path.exists():
             raise ValueError(f"Initial state file not found: {initial_state}")
-        cmd.extend(["-i", initial_state])
         log(f"Resuming from state file: {initial_state}", "INFO")
 
-    # Add game config parameters
-    if "win_value" in game_config:
-        cmd.extend(["--win-value", str(game_config["win_value"])])
-    if "draw_value" in game_config:
-        cmd.extend(["--draw-value", str(game_config["draw_value"])])
-    if "loss_value" in game_config:
-        cmd.extend(["--loss-value", str(game_config["loss_value"])])
-    if "num_practice_games" in game_config:
-        cmd.extend(["--num-practice-games", str(game_config["num_practice_games"])])
-    if "num_official_games" in game_config:
-        cmd.extend(["--num-official-games", str(game_config["num_official_games"])])
-    if "hint_penalty" in game_config:
-        cmd.extend(["--hint-penalty", str(game_config["hint_penalty"])])
+    # Create output directory with timestamp
+    model_name = model.replace("/", "-").replace(":", "-")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = Path(base_dir) / f"{model_name}-{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Start the command in the background
-    log(f"Running: {' '.join(cmd)}")
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    log(f"Output directory: {output_dir}", "SUCCESS")
 
-    # Wait for output directory to be created
-    output_dir = None
-    max_wait = 30  # Wait up to 30 seconds for directory to appear
-    for _ in range(max_wait):
-        time.sleep(1)
-        if output_base.exists():
-            new_dirs = set(output_base.iterdir()) - existing_dirs
-            if new_dirs:
-                output_dir = max(new_dirs, key=lambda x: x.stat().st_mtime)
-                log(f"Found output directory: {output_dir}", "SUCCESS")
+    # Save experiment config immediately
+    if experiment_name and full_config is not None:
+        log("Saving experiment config...", "INFO")
+        save_experiment_config(
+            str(output_dir),
+            experiment_name,
+            system_prompt,
+            user_prompt,
+            description,
+            full_config,
+            initial_state,
+        )
 
-                # Save experiment config immediately
-                if experiment_name and full_config is not None:
-                    log(
-                        "Saving experiment config (while runs are in progress)...",
-                        "INFO",
-                    )
-                    save_experiment_config(
-                        str(output_dir),
-                        experiment_name,
-                        system_prompt,
-                        user_prompt,
-                        description,
-                        full_config,
-                        initial_state,
-                    )
-                break
+    # Generate YAML config file for agent-interp-envs containers
+    config_file = None
+    if experiment is not None and run_config is not None:
+        config_file = output_dir / "container_config.yaml"
+        log(f"Generating YAML config: {config_file}", "INFO")
 
-    if output_dir is None:
-        # Kill the process if we couldn't find the directory
-        process.kill()
-        raise ValueError("Could not find output directory after 30 seconds")
+        # Prepare experiment dict with substituted prompts
+        experiment_with_prompts = experiment.copy()
+        if "prompts" not in experiment_with_prompts:
+            experiment_with_prompts["prompts"] = {}
 
-    # Now wait for the process to complete
-    stdout, stderr = process.communicate()
+        # Use the substituted prompts (which have template variables replaced)
+        experiment_with_prompts["prompts"]["system_prompt"] = system_prompt
+        experiment_with_prompts["prompts"]["user_prompt"] = user_prompt
 
-    if stdout:
-        print(stdout)
-    if stderr:
-        print(stderr, file=sys.stderr)
+        generate_yaml_config(
+            experiment=experiment_with_prompts,
+            run_config=run_config,
+            game_config=game_config,
+            output_path=config_file,
+        )
 
-    if process.returncode != 0:
-        raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+    # Prepare environment variables for containers (fallback for non-agent-interp-envs containers)
+    base_env_vars = {
+        "NO_CMD_INTERRUPT": "1",
+        "GAME": game,
+        "MODEL": model,
+        "MAX_STEPS": str(max_steps),
+        "SYSTEM_PROMPT": system_prompt if system_prompt else None,
+        "USER_PROMPT": user_prompt if user_prompt else None,
+        "WIN_VALUE": str(game_config.get("win_value")) if "win_value" in game_config else None,
+        "DRAW_VALUE": str(game_config.get("draw_value")) if "draw_value" in game_config else None,
+        "LOSS_VALUE": str(game_config.get("loss_value")) if "loss_value" in game_config else None,
+        "NUM_PRACTICE_GAMES": str(game_config.get("num_practice_games")) if "num_practice_games" in game_config else None,
+        "NUM_OFFICIAL_GAMES": str(game_config.get("num_official_games")) if "num_official_games" in game_config else None,
+        "HINT_PENALTY": str(game_config.get("hint_penalty")) if "hint_penalty" in game_config else None,
+    }
+
+    # Launch containers
+    start_time = time.time()
+    processes = []
+
+    log(f"\nLaunching {num_replicas} containers...", "INFO")
+    for i in range(1, num_replicas + 1):
+        run_id = f"{model_name}-{timestamp}-run{i}"
+        output_file = output_dir / f"run-{run_id}.txt"
+        state_dir = output_dir / f"state-run{i}"
+
+        log(f"[{i}/{num_replicas}] Launching container {i}...", "INFO")
+        log(f"    Output: {output_file}", "INFO")
+        if initial_state or True:  # Always enable state saving
+            log(f"    State: {state_dir}", "INFO")
+
+        process = run_docker_container(
+            image_tag=image_tag,
+            output_file=output_file,
+            env_vars=base_env_vars,
+            config_file=config_file,  # Mount YAML config for agent-interp-envs
+            state_dir=state_dir,
+            initial_state=initial_state,
+        )
+        processes.append(process)
+
+        # Small delay between launches to avoid race conditions
+        time.sleep(0.5)
+
+    log(f"\n✅ All {num_replicas} containers started!", "SUCCESS")
+    log("Monitoring progress...\n", "INFO")
+
+    # Monitor progress
+    last_status_time = time.time()
+    status_interval = 10  # Print status every 10 seconds
+
+    while True:
+        # Check if all processes are done
+        running = sum(1 for p in processes if p.poll() is None)
+        completed = len(processes) - running
+
+        # Print status update
+        current_time = time.time()
+        if current_time - last_status_time >= status_interval:
+            elapsed = int(current_time - start_time)
+            elapsed_fmt = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
+            progress = int(completed * 100 / len(processes))
+
+            log(f"Status: {running} running, {completed}/{len(processes)} completed ({progress}%) - Elapsed: {elapsed_fmt}", "INFO")
+            last_status_time = current_time
+
+        if running == 0:
+            break
+
+        time.sleep(2)
+
+    # Clean up output file handles
+    for process in processes:
+        if hasattr(process, '_output_file'):
+            process._output_file.close()
+
+    elapsed = int(time.time() - start_time)
+    elapsed_fmt = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
+
+    log(f"\n✨ All runs completed!", "SUCCESS")
+    log(f"Total time: {elapsed_fmt}", "INFO")
+    log(f"Output files: {output_dir}/run-*.txt", "INFO")
+    log(f"State directories: {output_dir}/state-run*/", "INFO")
+
+    # Create summary JSON
+    summary_file = output_dir / "experiment_summary.json"
+    summary = {
+        "experiment": {
+            "model": model,
+            "model_name": model_name,
+            "num_replicas": num_replicas,
+            "max_steps": max_steps,
+            "docker_image_tag": image_tag,
+            "save_state_enabled": True,
+            "initial_state_file": initial_state if initial_state else None,
+            "game": game,
+        },
+        "execution": {
+            "timestamp": timestamp,
+            "start_time": datetime.fromtimestamp(start_time).isoformat(),
+            "end_time": datetime.now().isoformat(),
+            "elapsed_seconds": elapsed,
+            "elapsed_formatted": elapsed_fmt,
+        },
+        "results": {
+            "completed": completed,
+            "running": 0,
+        },
+        "outputs": {
+            "output_directory": str(output_dir),
+            "log_files_pattern": f"run-{model_name}-{timestamp}-run*.txt",
+            "state_directories_pattern": "state-run*/",
+        },
+    }
+
+    with open(summary_file, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    log(f"Experiment summary: {summary_file}", "INFO")
 
     return str(output_dir)
 
@@ -453,14 +627,17 @@ def save_experiment_config(
 
 
 def run_single_experiment(
-    experiment: dict, config: dict, docker_tag: str = "ctfish-experiments:latest", base_dir: str = "continued_reasoning_results", initial_state_override: str = "", game: str = "tictactoe"
+    experiment: dict, config: dict, docker_tag: str = "ctfish-experiments:latest", base_dir: str = "results", initial_state_override: str = "", game: str = "tictactoe"
 ) -> dict:
     """Run a single experiment using environment variables (no rebuild needed)"""
     exp_name = experiment["name"]
-    system_prompt = experiment.get("system_prompt", "")
-    user_prompt = experiment.get("user_prompt", "")
+
+    # Get prompts from experiment.prompts or top-level (for backward compatibility)
+    prompts = experiment.get("prompts", {})
+    system_prompt = prompts.get("system_prompt", experiment.get("system_prompt", ""))
+    user_prompt = prompts.get("user_prompt", experiment.get("user_prompt", ""))
     description = experiment.get("description", "")
-    
+
     # Get initial_state from experiment config or override
     initial_state = initial_state_override or experiment.get("initial_state", "") or config.get("run_config", {}).get("initial_state", "")
 
@@ -494,15 +671,15 @@ def run_single_experiment(
         log("Step 1: Running parallel experiments", "INFO")
         run_config = config.get("run_config", {})
         game_config = config.get("game_config", {})
-        
+
         # Merge experiment-specific game_config (overrides global game_config)
         if "game_config" in experiment:
             game_config = {**game_config, **experiment["game_config"]}
-        
+
         # Log hint_penalty if set
         if "hint_penalty" in game_config:
             log(f"Hint penalty: {game_config['hint_penalty']} points", "INFO")
-        
+
         output_dir = run_parallel_experiments(
             image_tag=docker_tag,
             num_replicas=run_config.get("num_replicas", 10),
@@ -517,6 +694,8 @@ def run_single_experiment(
             base_dir=base_dir,
             initial_state=initial_state,
             game=game,
+            experiment=experiment,  # Pass full experiment config
+            run_config=run_config,  # Pass run_config for YAML generation
         )
 
         # Grading is disabled - will print commands at the end
@@ -563,7 +742,7 @@ def run_experiments(
     config_file: str = "experiment_config.json",
     experiments: list[str] | None = None,
     skip_build: bool = False,
-    base_dir: str = "continued_reasoning_results",
+    base_dir: str = "results",
     initial_state: str = "",
     game: str = "tictactoe",
 ):
@@ -574,7 +753,7 @@ def run_experiments(
         config_file: Path to experiment configuration JSON
         experiments: List of experiment names to run (runs all if None)
         skip_build: Skip Docker build step (useful for testing)
-        base_dir: Base directory for storing experiment outputs (default: continued_reasoning_results)
+        base_dir: Base directory for storing experiment outputs (default: results)
         initial_state: Path to state file to resume from (optional, overrides config)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
     """
@@ -604,37 +783,51 @@ def run_experiments(
     for exp in all_experiments:
         log(f"  - {exp['name']}: {exp.get('description', '')}", "INFO")
 
-    # Build Docker image ONCE for all experiments
-    docker_tag = "ctfish-experiments:latest"
+    # Determine container source and image to use
     docker_config = config.get("docker_config", {})
+    container_source = docker_config.get("container_source", "local")  # "dockerhub" or "local" (default)
+
+    # Determine docker_tag based on container source
+    if container_source == "dockerhub":
+        # Use image from Docker Hub
+        docker_tag = docker_config.get("container_image", "gkroiz/agent-interp-envs:tictactoe-latest")
+    elif container_source == "local":
+        # Use user-specified local image (default)
+        docker_tag = docker_config.get("container_image")
+        if not docker_tag:
+            log("Error: container_image must be specified when using container_source='local'", "ERROR")
+            sys.exit(1)
+    else:
+        log(f"Error: Unknown container_source '{container_source}'. Must be 'dockerhub' or 'local'", "ERROR")
+        sys.exit(1)
 
     if not skip_build:
         log("\n" + "=" * 80, "INFO")
-        log(f"BUILDING DOCKER IMAGE (once for all experiments, game: {game})", "INFO")
-        log("=" * 80, "INFO")
-        try:
-            build_docker_image(
-                tag=docker_tag,
-                game=game,
-                board_size=docker_config.get("board_size", 5),
-                win_length=docker_config.get("win_length", 5),
-                max_depth=docker_config.get("max_depth", 0),
-                multi_game=docker_config.get("multi_game", 0),
-                hints_enabled=docker_config.get("hints_enabled", 1),
-                good_engine=docker_config.get("good_engine", 1),
-                hint_ablation=docker_config.get("hint_ablation", 0),
-                chess_max_depth=docker_config.get("chess_max_depth", 15),
-                chess_analysis_time=docker_config.get("chess_analysis_time", 7.5),
-                chess_move_time=docker_config.get("chess_move_time", 1.0),
-                chess_hint_ablation=docker_config.get("chess_hint_ablation", 0),
-            )
-            log("Docker image ready for all experiments!", "SUCCESS")
-        except Exception as e:
-            log(f"Docker build failed: {e}", "ERROR")
-            log("Cannot continue without Docker image", "ERROR")
-            sys.exit(1)
+        if container_source == "dockerhub":
+            log(f"PULLING DOCKER IMAGE FROM DOCKER HUB", "INFO")
+            log(f"Image: {docker_tag}", "INFO")
+            log("=" * 80, "INFO")
+            try:
+                pull_docker_image(docker_tag)
+                log("Docker image ready for all experiments!", "SUCCESS")
+            except Exception as e:
+                log(f"Docker pull failed: {e}", "ERROR")
+                log("Cannot continue without Docker image", "ERROR")
+                sys.exit(1)
+        elif container_source == "local":
+            log(f"USING LOCAL DOCKER IMAGE", "INFO")
+            log(f"Image: {docker_tag}", "INFO")
+            log("=" * 80, "INFO")
+            try:
+                if not verify_local_docker_image(docker_tag):
+                    raise ValueError(f"Local Docker image not found: {docker_tag}")
+                log("Docker image ready for all experiments!", "SUCCESS")
+            except Exception as e:
+                log(f"Docker image verification failed: {e}", "ERROR")
+                log("Cannot continue without Docker image", "ERROR")
+                sys.exit(1)
     else:
-        log(f"\nSkipping Docker build, using existing image: {docker_tag}", "WARNING")
+        log(f"\nSkipping container setup, using existing image: {docker_tag}", "WARNING")
 
     # Run all experiments in parallel using threading
     results_queue = queue.Queue()
@@ -723,7 +916,7 @@ def main(
     config: str = "experiment_config.json",
     experiments: str | None = None,
     skip_build: bool = False,
-    base_dir: str = "continued_reasoning_results",
+    base_dir: str = "results",
     initial_state: str = "",
     game: str = "tictactoe",
 ):
@@ -734,7 +927,7 @@ def main(
         config: Path to experiment configuration JSON
         experiments: Comma-separated list of experiment names to run (runs all if not specified)
         skip_build: Skip Docker build step (useful for testing)
-        base_dir: Base directory for storing experiment outputs (default: continued_reasoning_results)
+        base_dir: Base directory for storing experiment outputs (default: results)
         initial_state: Path to state file to resume from (optional, overrides config)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
 
