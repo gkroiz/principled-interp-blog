@@ -4,13 +4,13 @@ Automated script to run multiple prompt experiments.
 
 This script automates the loop of:
 1. Prepare Docker image (pull from Docker Hub or use local)
-2. Run parallel experiments (passing prompts as env vars)
-3. Grade rollouts
+2. Run parallel experiments (generates YAML config and launches containers)
+3. Monitor execution and save results
 
 Usage:
-    python run_prompt_experiments.py --config experiment_config.json
-    python run_prompt_experiments.py --config experiment_config.json --experiments baseline powerless
-    python run_prompt_experiments.py --config experiment_config.json --initial-state states/ctfish-0003.json
+    python run_experiments.py --config experiment_config.json
+    python run_experiments.py --config experiment_config.json --experiments experiment1 experiment2
+    python run_experiments.py --config experiment_config.json --initial-state states/ctfish-0003.json
 
 Container Sources:
     Configure in docker_config section of your config file:
@@ -31,10 +31,10 @@ State Resumption:
     The --initial-state flag allows resuming experiments from a saved state file.
     This can be specified:
     1. Via command line: --initial-state=path/to/state.json (overrides config)
-    2. In run_config: {"run_config": {"initial_state": "path/to/state.json"}}
+    2. In default_config: {"default_config": {"initial_state": "path/to/state.json"}}
     3. Per experiment: {"experiments": [{"name": "exp1", "initial_state": "path/to/state.json"}]}
 
-    Priority: CLI flag > per-experiment config > run_config
+    Priority: CLI flag > per-experiment config > default_config
 """
 
 import json
@@ -48,6 +48,35 @@ from pathlib import Path
 
 import fire
 import yaml
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """
+    Deep merge two dictionaries, with override taking priority.
+
+    Args:
+        base: Base dictionary (e.g., default_config)
+        override: Override dictionary (e.g., experiment config)
+
+    Returns:
+        Merged dictionary where override values take priority
+
+    Example:
+        base = {"agent": {"model": "gpt-4", "max_steps": 30}, "foo": "bar"}
+        override = {"agent": {"model": "claude"}, "baz": "qux"}
+        result = {"agent": {"model": "claude", "max_steps": 30}, "foo": "bar", "baz": "qux"}
+    """
+    result = base.copy()
+
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            # Recursively merge nested dictionaries
+            result[key] = deep_merge(result[key], value)
+        else:
+            # Override takes priority for non-dict values or new keys
+            result[key] = value
+
+    return result
 
 
 def log(message: str, level: str = "INFO"):
@@ -100,10 +129,6 @@ def run_command(
             print(e.stderr, file=sys.stderr)
         raise
 
-
-# Note: No longer needed - we use environment variables instead of file modification
-# def modify_prompt_in_player(...) - REMOVED
-# def restore_player_backup(...) - REMOVED
 
 
 def pull_docker_image(image: str, max_retries: int = 3) -> None:
@@ -165,7 +190,7 @@ def verify_local_docker_image(image: str) -> bool:
 
 def generate_yaml_config(
     experiment: dict,
-    run_config: dict,
+    default_config: dict,
     game_config: dict,
     output_path: Path,
 ) -> None:
@@ -173,39 +198,31 @@ def generate_yaml_config(
     Generate YAML config file for agent-interp-envs containers
 
     Args:
-        experiment: Experiment configuration
-        run_config: Run configuration (model, max_steps)
-        game_config: Game configuration
+        experiment: Experiment configuration (will override defaults)
+        default_config: Default configuration (base values)
+        game_config: Legacy game configuration (fallback for task)
         output_path: Path to write YAML config
     """
-    # Get task configuration (from experiment or game_config)
-    task_config = {}
-    if "task" in experiment:
-        task_config = experiment["task"].copy()
-    else:
-        task_config = game_config.copy()
+    # Merge default_config with experiment config (experiment takes priority)
+    merged = deep_merge(default_config, experiment)
+
+    # Get task configuration (from merged config or fall back to game_config)
+    task_config = merged.get("task", game_config.copy())
 
     # Build config structure matching agent-interp-envs format
+    agent_config = merged.get("agent", {})
     config = {
-        "environment": experiment.get("environment", "tictactoe"),
+        "environment": merged.get("environment", "tictactoe"),
         "agent": {
-            "model": run_config.get("model", "openai/gpt-4"),
-            "max_steps": run_config.get("max_steps", 30),
+            "model": agent_config.get("model", "openai/gpt-4"),
+            "max_steps": agent_config.get("max_steps", 30),
         },
         "task": task_config,
-        "prompts": {
+        "prompts": merged.get("prompts", {
             "system_prompt": "",
             "user_prompt": "",
-        },
+        }),
     }
-
-    # Add experiment-specific agent config if present
-    if "agent" in experiment:
-        config["agent"].update(experiment["agent"])
-
-    # Add prompts from experiment if present
-    if "prompts" in experiment:
-        config["prompts"] = experiment["prompts"]
 
     # Write YAML config
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +230,7 @@ def generate_yaml_config(
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
-def run_docker_container(
+def launch_container(
     image_tag: str,
     output_file: Path,
     env_vars: dict,
@@ -275,8 +292,7 @@ def run_docker_container(
     if state_dir:
         state_dir.mkdir(parents=True, exist_ok=True)
         docker_args.extend([
-            "-v", f"{state_dir.absolute()}:/tmp/states",
-            "-e", "STATE_DIR=/tmp/states"
+            "-v", f"{state_dir.absolute()}:/tmp/output"
         ])
 
         if initial_state:
@@ -311,7 +327,7 @@ def run_docker_container(
     return process
 
 
-def run_parallel_experiments(
+def run_experiment_replicas(
     image_tag: str,
     num_replicas: int,
     model: str,
@@ -326,10 +342,10 @@ def run_parallel_experiments(
     initial_state: str = "",
     game: str = "tictactoe",
     experiment: dict = None,
-    run_config: dict = None,
+    default_config: dict = None,
 ) -> str:
     """
-    Run parallel experiments by launching Docker containers directly
+    Run multiple replicas of a single experiment in parallel
 
     Args:
         image_tag: Docker image tag to run
@@ -346,7 +362,7 @@ def run_parallel_experiments(
         initial_state: Path to state file to resume from (optional)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
         experiment: Full experiment dict for YAML config generation (optional)
-        run_config: Run configuration for YAML config generation (optional)
+        default_config: Default configuration for YAML config generation (optional)
 
     Returns:
         Output directory path
@@ -363,6 +379,136 @@ def run_parallel_experiments(
             raise ValueError(f"Initial state file not found: {initial_state}")
         log(f"Resuming from state file: {initial_state}", "INFO")
 
+    # Set up output directory and config files
+    output_dir, config_file, model_name, timestamp = setup_experiment_output(
+        model=model,
+        base_dir=base_dir,
+        experiment_name=experiment_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        description=description,
+        full_config=full_config,
+        initial_state=initial_state,
+        experiment=experiment,
+        default_config=default_config,
+        game_config=game_config,
+    )
+
+    # Launch containers
+    start_time = time.time()
+    processes = []
+
+    log(f"\nLaunching {num_replicas} containers...", "INFO")
+    for i in range(1, num_replicas + 1):
+        run_id = f"{model_name}-{timestamp}-run{i}"
+        output_file = output_dir / f"run-{run_id}.txt"
+        state_dir = output_dir / f"state-run{i}"
+
+        log(f"[{i}/{num_replicas}] Launching container {i}...", "INFO")
+        log(f"    Output: {output_file}", "INFO")
+        if initial_state or True:  # Always enable state saving
+            log(f"    State: {state_dir}", "INFO")
+
+        process = launch_container(
+            image_tag=image_tag,
+            output_file=output_file,
+            env_vars={},  # API keys come from .env, config comes from YAML
+            config_file=config_file,  # Mount YAML config for agent-interp-envs
+            state_dir=state_dir,
+            initial_state=initial_state,
+        )
+        processes.append(process)
+
+        # Small delay between launches to avoid race conditions
+        time.sleep(0.5)
+
+    # Monitor container execution
+    elapsed = monitor_containers(processes, start_time)
+
+    # Create experiment summary
+    create_experiment_summary(
+        output_dir=output_dir,
+        model=model,
+        model_name=model_name,
+        timestamp=timestamp,
+        num_replicas=num_replicas,
+        max_steps=max_steps,
+        image_tag=image_tag,
+        initial_state=initial_state,
+        game=game,
+        start_time=start_time,
+        elapsed=elapsed,
+    )
+
+    return str(output_dir)
+
+
+def save_experiment_config(
+    output_dir: str,
+    experiment_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    description: str,
+    config: dict,
+    initial_state: str = "",
+) -> None:
+    """Save experiment configuration to output directory"""
+    exp_config = {
+        "experiment": {
+            "name": experiment_name,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "description": description,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "docker_config": config.get("docker_config", {}),
+        "default_config": config.get("default_config", {}),
+        "game_config": config.get("game_config", {}),
+    }
+
+    # Add initial_state if provided
+    if initial_state:
+        exp_config["experiment"]["initial_state_file"] = initial_state
+
+    config_file = Path(output_dir) / "experiment_config.json"
+    with open(config_file, "w") as f:
+        json.dump(exp_config, f, indent=2)
+
+    log(f"Saved experiment config to: {config_file}", "SUCCESS")
+
+
+def setup_experiment_output(
+    model: str,
+    base_dir: str,
+    experiment_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    description: str,
+    full_config: dict,
+    initial_state: str,
+    experiment: dict,
+    default_config: dict,
+    game_config: dict,
+) -> tuple[Path, Path | None, str, str]:
+    """
+    Set up output directory and configuration files for an experiment
+
+    Args:
+        model: Model name
+        base_dir: Base directory for storing experiment outputs
+        experiment_name: Name of the experiment
+        system_prompt: System prompt
+        user_prompt: User prompt
+        description: Experiment description
+        full_config: Full experiment configuration
+        initial_state: Path to state file to resume from (optional)
+        experiment: Full experiment dict for YAML config generation
+        default_config: Default configuration for YAML config generation
+        game_config: Game configuration
+
+    Returns:
+        Tuple of (output_dir, config_file, model_name, timestamp)
+    """
     # Create output directory with timestamp
     model_name = model.replace("/", "-").replace(":", "-")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -386,74 +532,43 @@ def run_parallel_experiments(
 
     # Generate YAML config file for agent-interp-envs containers
     config_file = None
-    if experiment is not None and run_config is not None:
+    if experiment is not None and default_config is not None:
         config_file = output_dir / "container_config.yaml"
         log(f"Generating YAML config: {config_file}", "INFO")
 
-        # Prepare experiment dict with substituted prompts
+        # Prepare experiment dict with prompts
         experiment_with_prompts = experiment.copy()
         if "prompts" not in experiment_with_prompts:
             experiment_with_prompts["prompts"] = {}
 
-        # Use the substituted prompts (which have template variables replaced)
+        # Set prompts (template variables will be substituted by agent-interp-envs)
         experiment_with_prompts["prompts"]["system_prompt"] = system_prompt
         experiment_with_prompts["prompts"]["user_prompt"] = user_prompt
 
         generate_yaml_config(
             experiment=experiment_with_prompts,
-            run_config=run_config,
+            default_config=default_config,
             game_config=game_config,
             output_path=config_file,
         )
 
-    # Prepare environment variables for containers (fallback for non-agent-interp-envs containers)
-    base_env_vars = {
-        "NO_CMD_INTERRUPT": "1",
-        "GAME": game,
-        "MODEL": model,
-        "MAX_STEPS": str(max_steps),
-        "SYSTEM_PROMPT": system_prompt if system_prompt else None,
-        "USER_PROMPT": user_prompt if user_prompt else None,
-        "WIN_VALUE": str(game_config.get("win_value")) if "win_value" in game_config else None,
-        "DRAW_VALUE": str(game_config.get("draw_value")) if "draw_value" in game_config else None,
-        "LOSS_VALUE": str(game_config.get("loss_value")) if "loss_value" in game_config else None,
-        "NUM_PRACTICE_GAMES": str(game_config.get("num_practice_games")) if "num_practice_games" in game_config else None,
-        "NUM_OFFICIAL_GAMES": str(game_config.get("num_official_games")) if "num_official_games" in game_config else None,
-        "HINT_PENALTY": str(game_config.get("hint_penalty")) if "hint_penalty" in game_config else None,
-    }
+    return output_dir, config_file, model_name, timestamp
 
-    # Launch containers
-    start_time = time.time()
-    processes = []
 
-    log(f"\nLaunching {num_replicas} containers...", "INFO")
-    for i in range(1, num_replicas + 1):
-        run_id = f"{model_name}-{timestamp}-run{i}"
-        output_file = output_dir / f"run-{run_id}.txt"
-        state_dir = output_dir / f"state-run{i}"
+def monitor_containers(processes: list[subprocess.Popen], start_time: float) -> int:
+    """
+    Monitor running containers and print status updates
 
-        log(f"[{i}/{num_replicas}] Launching container {i}...", "INFO")
-        log(f"    Output: {output_file}", "INFO")
-        if initial_state or True:  # Always enable state saving
-            log(f"    State: {state_dir}", "INFO")
+    Args:
+        processes: List of container processes to monitor
+        start_time: Experiment start time
 
-        process = run_docker_container(
-            image_tag=image_tag,
-            output_file=output_file,
-            env_vars=base_env_vars,
-            config_file=config_file,  # Mount YAML config for agent-interp-envs
-            state_dir=state_dir,
-            initial_state=initial_state,
-        )
-        processes.append(process)
-
-        # Small delay between launches to avoid race conditions
-        time.sleep(0.5)
-
-    log(f"\n✅ All {num_replicas} containers started!", "SUCCESS")
+    Returns:
+        Total elapsed time in seconds
+    """
+    log(f"\n✅ All {len(processes)} containers started!", "SUCCESS")
     log("Monitoring progress...\n", "INFO")
 
-    # Monitor progress
     last_status_time = time.time()
     status_interval = 10  # Print status every 10 seconds
 
@@ -487,6 +602,41 @@ def run_parallel_experiments(
 
     log(f"\n✨ All runs completed!", "SUCCESS")
     log(f"Total time: {elapsed_fmt}", "INFO")
+
+    return elapsed
+
+
+def create_experiment_summary(
+    output_dir: Path,
+    model: str,
+    model_name: str,
+    timestamp: str,
+    num_replicas: int,
+    max_steps: int,
+    image_tag: str,
+    initial_state: str,
+    game: str,
+    start_time: float,
+    elapsed: int,
+) -> None:
+    """
+    Create experiment summary JSON file
+
+    Args:
+        output_dir: Output directory path
+        model: Model name
+        model_name: Sanitized model name
+        timestamp: Experiment timestamp
+        num_replicas: Number of replicas run
+        max_steps: Maximum steps per run
+        image_tag: Docker image tag used
+        initial_state: Path to initial state file (optional)
+        game: Game type
+        start_time: Experiment start time
+        elapsed: Total elapsed time in seconds
+    """
+    elapsed_fmt = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
+
     log(f"Output files: {output_dir}/run-*.txt", "INFO")
     log(f"State directories: {output_dir}/state-run*/", "INFO")
 
@@ -511,7 +661,7 @@ def run_parallel_experiments(
             "elapsed_formatted": elapsed_fmt,
         },
         "results": {
-            "completed": completed,
+            "completed": num_replicas,
             "running": 0,
         },
         "outputs": {
@@ -526,165 +676,79 @@ def run_parallel_experiments(
 
     log(f"Experiment summary: {summary_file}", "INFO")
 
-    return str(output_dir)
 
-
-def grade_rollouts(output_dir: str, model: str = "google/gemini-2.5-flash", game: str = "tictactoe") -> dict:
-    """
-    DISABLED: Grading is currently disabled due to WSL path issues.
-
-    To grade manually, run:
-        python judge/grade_rollouts_v2.py --output_dir=<output_dir> --game=<game>
-
-    Returns:
-        Empty summary dictionary
-    """
-    log(f"Grading disabled for {output_dir}", "WARNING")
-    log(
-        f"To grade manually, run: python judge/grade_rollouts_v2.py --output_dir={output_dir} --game={game}",
-        "INFO",
-    )
-    return {}
-
-
-def substitute_template_variables(text: str, config: dict) -> str:
-    """
-    Substitute template variables in text with values from config.
-
-    Supports variables from docker_config and game_config:
-    - {board_size}, {win_length}, {max_depth}, {multi_game}, {hints_enabled}, {good_engine}
-    - {win_value}, {draw_value}, {loss_value}
-    - {num_practice_games}, {num_official_games}, {hint_penalty}
-    - {practice_games_lost}, {practice_game_win_rate}
-    - {win_value_doubled} (calculated as win_value * 2)
-    """
-    docker_config = config.get("docker_config", {})
-    game_config = config.get("game_config", {})
-
-    # Build substitution dictionary
-    substitutions = {
-        # Docker config values
-        "board_size": docker_config.get("board_size", 5),
-        "win_length": docker_config.get("win_length", 5),
-        "max_depth": docker_config.get("max_depth", 0),
-        "multi_game": docker_config.get("multi_game", 0),
-        "hints_enabled": docker_config.get("hints_enabled", 1),
-        "good_engine": docker_config.get("good_engine", 1),
-        # Game config values
-        "win_value": game_config.get("win_value", 10),
-        "draw_value": game_config.get("draw_value", 0),
-        "loss_value": game_config.get("loss_value", 0),
-        "num_practice_games": game_config.get("num_practice_games", 1),
-        "num_official_games": game_config.get("num_official_games", 1),
-        "hint_penalty": game_config.get("hint_penalty", 10),
-        "practice_games_lost": game_config.get("practice_games_lost", 0),
-        "practice_game_win_rate": game_config.get("practice_game_win_rate", 0),
-    }
-
-    # Add calculated values
-    substitutions["win_value_doubled"] = substitutions["win_value"] * 2
-
-    # Perform substitution
-    result = text
-    for key, value in substitutions.items():
-        result = result.replace(f"{{{key}}}", str(value))
-
-    return result
-
-
-def save_experiment_config(
-    output_dir: str,
-    experiment_name: str,
-    system_prompt: str,
-    user_prompt: str,
-    description: str,
+def execute_single_experiment(
+    experiment: dict,
+    exp_num: int,
+    docker_tag: str,
     config: dict,
-    initial_state: str = "",
+    initial_state: str,
+    base_dir: str,
+    game: str,
+    results_queue: queue.Queue,
 ) -> None:
-    """Save experiment configuration to output directory"""
-    exp_config = {
-        "experiment": {
-            "name": experiment_name,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "description": description,
-            "timestamp": datetime.now().isoformat(),
-        },
-        "docker_config": config.get("docker_config", {}),
-        "run_config": config.get("run_config", {}),
-        "game_config": config.get("game_config", {}),
-    }
-    
-    # Add initial_state if provided
-    if initial_state:
-        exp_config["experiment"]["initial_state_file"] = initial_state
+    """
+    Execute a single experiment (runs in a thread)
 
-    config_file = Path(output_dir) / "experiment_config.json"
-    with open(config_file, "w") as f:
-        json.dump(exp_config, f, indent=2)
-
-    log(f"Saved experiment config to: {config_file}", "SUCCESS")
-
-
-def run_single_experiment(
-    experiment: dict, config: dict, docker_tag: str = "ctfish-experiments:latest", base_dir: str = "results", initial_state_override: str = "", game: str = "tictactoe"
-) -> dict:
-    """Run a single experiment using environment variables (no rebuild needed)"""
+    Args:
+        experiment: Experiment configuration
+        exp_num: Experiment number (for logging)
+        docker_tag: Docker image tag to use
+        config: Full configuration dict
+        initial_state: Path to state file to resume from (optional)
+        base_dir: Base directory for storing experiment outputs
+        game: Game type ('chess' or 'tictactoe')
+        results_queue: Queue to put results in
+    """
     exp_name = experiment["name"]
-
-    # Get prompts from experiment.prompts or top-level (for backward compatibility)
-    prompts = experiment.get("prompts", {})
-    system_prompt = prompts.get("system_prompt", experiment.get("system_prompt", ""))
-    user_prompt = prompts.get("user_prompt", experiment.get("user_prompt", ""))
-    description = experiment.get("description", "")
-
-    # Get initial_state from experiment config or override
-    initial_state = initial_state_override or experiment.get("initial_state", "") or config.get("run_config", {}).get("initial_state", "")
-
-    # Merge experiment-specific game_config for template substitution
-    merged_config = config.copy()
-    if "game_config" in experiment:
-        merged_config["game_config"] = {**config.get("game_config", {}), **experiment["game_config"]}
-
-    # Substitute template variables from merged config
-    system_prompt = substitute_template_variables(system_prompt, merged_config)
-    user_prompt = substitute_template_variables(user_prompt, merged_config)
-
-    log("=" * 80, "INFO")
-    log(f"STARTING EXPERIMENT: {exp_name}", "SUCCESS")
-    log(f"Description: {description}", "INFO")
-    log(
-        f"User Prompt: {user_prompt[:100]}..."
-        if len(user_prompt) > 100
-        else f"User Prompt: {user_prompt}",
-        "INFO",
-    )
-    if initial_state:
-        log(f"Initial State: {initial_state}", "INFO")
-    log("=" * 80, "INFO")
+    log(f"[Experiment {exp_num}] Starting: {exp_name}", "INFO")
 
     start_time = time.time()
 
     try:
-        # Run parallel experiments with prompts passed as environment variables
-        # Config is saved automatically as soon as output directory is created
-        log("Step 1: Running parallel experiments", "INFO")
-        run_config = config.get("run_config", {})
-        game_config = config.get("game_config", {})
+        # Merge default_config with experiment config (experiment takes priority)
+        default_config = config.get("default_config", {})
+        merged_config = deep_merge(default_config, experiment)
 
-        # Merge experiment-specific game_config (overrides global game_config)
-        if "game_config" in experiment:
-            game_config = {**game_config, **experiment["game_config"]}
+        # Get prompts from merged config (supports both experiment.prompts and top-level for backward compatibility)
+        prompts = merged_config.get("prompts", {})
+        system_prompt = prompts.get("system_prompt", merged_config.get("system_prompt", ""))
+        user_prompt = prompts.get("user_prompt", merged_config.get("user_prompt", ""))
+        description = merged_config.get("description", "")
+
+        # Get initial_state (CLI override > experiment config > default_config)
+        exp_initial_state = initial_state or merged_config.get("initial_state", "")
+
+        log("=" * 80, "INFO")
+        log(f"EXPERIMENT: {exp_name}", "SUCCESS")
+        log(f"Description: {description}", "INFO")
+        log(
+            f"User Prompt: {user_prompt[:100]}..."
+            if len(user_prompt) > 100
+            else f"User Prompt: {user_prompt}",
+            "INFO",
+        )
+        if exp_initial_state:
+            log(f"Initial State: {exp_initial_state}", "INFO")
+        log("=" * 80, "INFO")
+
+        # Get merged configs (experiment values override defaults)
+        game_config = merged_config.get("game_config", config.get("game_config", {}))
+        agent_config = merged_config.get("agent", {})
 
         # Log hint_penalty if set
-        if "hint_penalty" in game_config:
+        task_config = merged_config.get("task", {})
+        if "hint_penalty" in task_config:
+            log(f"Hint penalty: {task_config['hint_penalty']} points", "INFO")
+        elif "hint_penalty" in game_config:
             log(f"Hint penalty: {game_config['hint_penalty']} points", "INFO")
 
-        output_dir = run_parallel_experiments(
+        # Run experiment replicas
+        output_dir = run_experiment_replicas(
             image_tag=docker_tag,
-            num_replicas=run_config.get("num_replicas", 10),
-            model=run_config.get("model", "openai/gpt-oss-20b"),
-            max_steps=run_config.get("max_steps", 999999),
+            num_replicas=merged_config.get("num_replicas", 10),
+            model=agent_config.get("model", "openai/gpt-4"),
+            max_steps=agent_config.get("max_steps", 30),
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             game_config=game_config,
@@ -692,14 +756,11 @@ def run_single_experiment(
             description=description,
             full_config=config,
             base_dir=base_dir,
-            initial_state=initial_state,
+            initial_state=exp_initial_state,
             game=game,
-            experiment=experiment,  # Pass full experiment config
-            run_config=run_config,  # Pass run_config for YAML generation
+            experiment=experiment,
+            default_config=default_config,
         )
-
-        # Grading is disabled - will print commands at the end
-        summary = {}
 
         elapsed = time.time() - start_time
 
@@ -708,7 +769,7 @@ def run_single_experiment(
             "status": "success",
             "output_dir": output_dir,
             "elapsed_seconds": elapsed,
-            "summary": summary,
+            "summary": {},
             "game": game,
         }
 
@@ -718,24 +779,23 @@ def run_single_experiment(
         log(f"Elapsed time: {elapsed / 60:.1f} minutes", "INFO")
         log("=" * 80, "INFO")
 
-        return result
-
     except Exception as e:
         log(f"EXPERIMENT FAILED: {exp_name}", "ERROR")
         log(f"Error: {e}", "ERROR")
 
-        # Print full traceback for debugging
         import traceback
-
         traceback.print_exc()
 
-        return {
+        result = {
             "name": exp_name,
             "status": "failed",
             "error": str(e),
             "traceback": traceback.format_exc(),
             "elapsed_seconds": time.time() - start_time,
         }
+
+    results_queue.put((exp_num, result))
+    log(f"[Experiment {exp_num}] Completed: {exp_name}", "SUCCESS")
 
 
 def run_experiments(
@@ -837,17 +897,11 @@ def run_experiments(
     log(f"LAUNCHING {len(all_experiments)} EXPERIMENTS IN PARALLEL", "SUCCESS")
     log("=" * 80, "INFO")
 
-    def run_experiment_thread(experiment, config, docker_tag, exp_num, base_dir, initial_state_override, game):
-        """Run a single experiment in a thread"""
-        log(f"[Experiment {exp_num}] Starting: {experiment['name']}", "INFO")
-        result = run_single_experiment(experiment, config, docker_tag=docker_tag, base_dir=base_dir, initial_state_override=initial_state_override, game=game)
-        results_queue.put((exp_num, result))
-        log(f"[Experiment {exp_num}] Completed: {experiment['name']}", "SUCCESS")
-
     # Launch all experiment threads
     for i, experiment in enumerate(all_experiments, 1):
         thread = threading.Thread(
-            target=run_experiment_thread, args=(experiment, config, docker_tag, i, base_dir, initial_state, game)
+            target=execute_single_experiment,
+            args=(experiment, i, docker_tag, config, initial_state, base_dir, game, results_queue)
         )
         thread.start()
         threads.append(thread)
@@ -903,7 +957,7 @@ def run_experiments(
         for result in successful_results:
             game_param = result.get("game", "tictactoe")
             commands.append(
-                f"python judge/grade_rollouts_v2.py --output_dir={result['output_dir']} --game={game_param}"
+                f"python judge/grade_rollouts.py --output_dir={result['output_dir']} --game={game_param}"
             )
 
         combined_command = " && \\\n".join(commands)
@@ -930,25 +984,6 @@ def main(
         base_dir: Base directory for storing experiment outputs (default: results)
         initial_state: Path to state file to resume from (optional, overrides config)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
-
-    Examples:
-        # Run all experiments in config
-        python run_prompt_experiments.py
-        
-        # Run with chess
-        python run_prompt_experiments.py --game=chess
-
-        # Run specific experiments
-        python run_prompt_experiments.py --experiments=baseline,powerless
-
-        # Skip Docker build (reuse existing images)
-        python run_prompt_experiments.py --skip-build
-        
-        # Use custom base directory
-        python run_prompt_experiments.py --base-dir=my_experiments
-        
-        # Resume from a state file
-        python run_prompt_experiments.py --initial-state=states/ctfish-0003.json
     """
     print(f"Running experiments: {experiments}")
     if not isinstance(experiments, tuple):
