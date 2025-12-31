@@ -1,28 +1,135 @@
 #!/bin/bash
-# git  classify conversation state files (PARALLELIZED)
+# Batch classify conversation state files (PARALLELIZED)
 # Only processes the final (highest-numbered) state file from each run directory
 
 set -e
 
-# Check if directory argument provided
-if [ $# -eq 0 ]; then
-    echo "Usage: $0 <directory> [output_dir] [model] [parallel_jobs]"
+# Default values
+INPUT_DIR=""
+OUTPUT_DIR="./thought_anchors/classifications"
+MODEL="google/gemini-2.5-pro"
+PARALLEL_JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+CLASSIFIER_TYPE="standard"
+
+# Print usage
+usage() {
+    echo "Usage: $0 --directory <input_dir> [OPTIONS]"
+    echo ""
+    echo "Required arguments:"
+    echo "  -d, --directory DIR        Input directory containing state-run* subdirectories"
+    echo ""
+    echo "Optional arguments:"
+    echo "  -o, --output-dir DIR       Output directory for classifications (default: ./thought_anchors/classifications)"
+    echo "  -m, --model MODEL          Model to use for classification (default: google/gemini-2.5-pro)"
+    echo "  -j, --jobs N               Number of parallel jobs (default: auto-detect CPU count)"
+    echo "  -t, --type TYPE            Classifier type: 'standard', 'exploits', 'exploration', 'hopelessness', 'fairness', 'misunderstandings', or 'objective' (default: standard)"
+    echo "  -h, --help                 Show this help message"
+    echo ""
+    echo "Classifier types:"
+    echo "  standard         : Uses classify_agent_task_approach.py (general task approach taxonomy)"
+    echo "  exploits         : Uses classify_agent_exploit_precursors.py (reward hacking precursors)"
+    echo "  exploration      : Uses classify_agent_exploration_types.py (exploration action types)"
+    echo "  hopelessness     : Uses classify_agent_hopelessness.py (perceived hopelessness)"
+    echo "  fairness         : Uses classify_agent_fairness.py (fair vs unfair play perception)"
+    echo "  misunderstandings: Uses classify_agent_misunderstandings.py (understanding vs misunderstanding)"
+    echo "  objective        : Uses classify_agent_objective_interpretation.py (how agent interprets objective)"
     echo ""
     echo "Examples:"
-    echo "  $0 continued_reasoning_results/2_games/"
-    echo "  $0 continued_reasoning_results/2_games/ ./classifications/"
-    echo "  $0 continued_reasoning_results/gpt-5-2025-08-07-20251030-014424/ ./classifications/"
-    echo "  $0 continued_reasoning_results/2_games/ ./classifications/ google/gemini-2.5-pro 8"
+    echo "  $0 --directory continued_reasoning_results/2_games/"
+    echo "  $0 -d continued_reasoning_results/2_games/ -o ./classifications/"
+    echo "  $0 -d continued_reasoning_results/2_games/ -m google/gemini-2.5-pro -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t exploits -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t exploration -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t hopelessness -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t fairness -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t misunderstandings -j 8"
+    echo "  $0 -d continued_reasoning_results/2_games/ -t objective -j 8"
     echo ""
     echo "Note: For each state-runXX directory, only the final state file is processed"
     echo "      (since each state file contains cumulative history)"
     exit 1
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--directory)
+            INPUT_DIR="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -m|--model)
+            MODEL="$2"
+            shift 2
+            ;;
+        -j|--jobs)
+            PARALLEL_JOBS="$2"
+            shift 2
+            ;;
+        -t|--type)
+            CLASSIFIER_TYPE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Error: Unknown option: $1"
+            echo ""
+            usage
+            ;;
+    esac
+done
+
+# Check if required directory argument provided
+if [ -z "$INPUT_DIR" ]; then
+    echo "Error: --directory argument is required"
+    echo ""
+    usage
 fi
 
-INPUT_DIR="$1"
-OUTPUT_DIR="${2:-./thought_anchors/classifications}"
-MODEL="${3:-google/gemini-2.5-pro}"
-PARALLEL_JOBS="${4:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+# Validate and set classifier script
+if [ "$CLASSIFIER_TYPE" = "exploits" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_exploit_precursors.py"
+    CLASSIFIER_NAME="Exploit Precursors"
+    OUTPUT_SUFFIX="exploits_classified"
+elif [ "$CLASSIFIER_TYPE" = "exploration" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_exploration_types.py"
+    CLASSIFIER_NAME="Exploration Types"
+    OUTPUT_SUFFIX="exploration_classified"
+elif [ "$CLASSIFIER_TYPE" = "hopelessness" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_hopelessness.py"
+    CLASSIFIER_NAME="Hopelessness"
+    OUTPUT_SUFFIX="hopelessness_classified"
+elif [ "$CLASSIFIER_TYPE" = "fairness" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_fairness.py"
+    CLASSIFIER_NAME="Fairness"
+    OUTPUT_SUFFIX="fairness_classified"
+elif [ "$CLASSIFIER_TYPE" = "misunderstandings" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_misunderstandings.py"
+    CLASSIFIER_NAME="Misunderstandings"
+    OUTPUT_SUFFIX="misunderstandings_classified"
+elif [ "$CLASSIFIER_TYPE" = "objective" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_objective_interpretation.py"
+    CLASSIFIER_NAME="Objective Interpretation"
+    OUTPUT_SUFFIX="objective_classified"
+elif [ "$CLASSIFIER_TYPE" = "standard" ]; then
+    CLASSIFIER_SCRIPT="analysis/actions_branches/action_classification/classification_scripts/classify_agent_task_approach.py"
+    CLASSIFIER_NAME="Task Approach"
+    OUTPUT_SUFFIX="classified"
+else
+    echo "Error: Invalid classifier_type '$CLASSIFIER_TYPE'. Must be 'standard', 'exploits', 'exploration', 'hopelessness', 'fairness', 'misunderstandings', or 'objective'."
+    exit 1
+fi
+
+# Check if classifier script exists
+if [ ! -f "$CLASSIFIER_SCRIPT" ]; then
+    echo "Error: Classifier script not found: $CLASSIFIER_SCRIPT"
+    exit 1
+fi
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -75,8 +182,8 @@ FILES=""
 DIR_COUNT=0
 for state_dir in $STATE_DIRS; do
     DIR_COUNT=$((DIR_COUNT + 1))
-    # Find the highest numbered ctfish-tictactoe-*.json file
-    LAST_FILE=$(ls "$state_dir"/ctfish-tictactoe-*.json 2>/dev/null | sort -V | tail -1)
+    # Find the highest numbered ctfish-*.json file
+    LAST_FILE=$(ls "$state_dir"/ctfish-*.json 2>/dev/null | sort -V | tail -1)
     if [ -n "$LAST_FILE" ]; then
         FILES="$FILES$LAST_FILE"$'\n'
     fi
@@ -86,13 +193,14 @@ done
 FILES=$(echo "$FILES" | sed '/^$/d')
 
 if [ -z "$FILES" ]; then
-    echo "No ctfish-tictactoe-*.json files found in state-run directories"
+    echo "No ctfish-*.json files found in state-run directories"
     exit 1
 fi
 
 FILE_COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
 echo "Found $DIR_COUNT state-run directories"
 echo "Processing $FILE_COUNT final state files (one per run)"
+echo "Classifier: $CLASSIFIER_NAME ($CLASSIFIER_SCRIPT)"
 echo "Using model: $MODEL"
 echo "Output directory: $OUTPUT_DIR"
 echo "Parallel jobs: $PARALLEL_JOBS"
@@ -113,6 +221,8 @@ process_file() {
     local model="$5"
     local log_file="$6"
     local progress_file="$7"
+    local classifier_script="$8"
+    local output_suffix="$9"
     
     # Extract state-run directory name, experiment directory name, and file basename
     local STATE_DIR=$(basename $(dirname "$file"))
@@ -120,7 +230,7 @@ process_file() {
     local FILE_BASENAME=$(basename "$file" .json)
     
     # Generate output filename with experiment directory to avoid collisions
-    local OUTPUT_FILE="$output_dir/${EXPERIMENT_DIR}_${STATE_DIR}_${FILE_BASENAME}_classified.json"
+    local OUTPUT_FILE="$output_dir/${EXPERIMENT_DIR}_${STATE_DIR}_${FILE_BASENAME}_${output_suffix}.json"
     
     echo "[$current/$total] Processing: $EXPERIMENT_DIR/$STATE_DIR/$FILE_BASENAME" >> "$log_file"
     
@@ -134,7 +244,7 @@ process_file() {
     fi
     
     # Run classification
-    if python thought_anchors/classify_agent_turns.py "$file" --output "$OUTPUT_FILE" --model "$model" 2>&1 | sed 's/^/  /' >> "$log_file"; then
+    if python "$classifier_script" "$file" --output "$OUTPUT_FILE" --model "$model" 2>&1 | sed 's/^/  /' >> "$log_file"; then
         echo "  -> ✓ Saved: $(basename "$OUTPUT_FILE")" >> "$log_file"
         # Increment progress
         local count=$(cat "$progress_file")
@@ -176,7 +286,7 @@ for file in $FILES; do
     LOG_FILES+=("$LOG_FILE")
     
     # Launch job in background
-    process_file "$file" "$CURRENT" "$FILE_COUNT" "$OUTPUT_DIR" "$MODEL" "$LOG_FILE" "$PROGRESS_FILE" &
+    process_file "$file" "$CURRENT" "$FILE_COUNT" "$OUTPUT_DIR" "$MODEL" "$LOG_FILE" "$PROGRESS_FILE" "$CLASSIFIER_SCRIPT" "$OUTPUT_SUFFIX" &
     PIDS+=($!)
     
     # If we've reached the parallel limit, wait for one job to complete
@@ -234,12 +344,17 @@ from pathlib import Path
 from collections import defaultdict
 
 output_dir = Path("$OUTPUT_DIR")
-results_files = list(output_dir.glob("*_classified.json"))
+output_suffix = "$OUTPUT_SUFFIX"
+classifier_name = "$CLASSIFIER_NAME"
+
+# Match files from this classification run
+results_files = list(output_dir.glob(f"*_{output_suffix}.json"))
 
 if not results_files:
     print("No classification results found")
     exit(0)
 
+print(f"Classifier: {classifier_name}")
 print(f"Found {len(results_files)} classification results")
 print("="*70)
 
@@ -265,7 +380,7 @@ for result_file in results_files:
     })
 
 # Print overall summary
-print(f"\nOVERALL SUMMARY")
+print(f"\nOVERALL SUMMARY - {classifier_name} Classification")
 print("="*70)
 print(f"Total files processed: {len(results_files)}")
 print(f"Total assistant turns: {total_turns}")
@@ -276,9 +391,11 @@ for cat, count in sorted(category_totals.items(), key=lambda x: -x[1]):
     print(f"  {cat:40s}: {count:4d} ({pct:5.1f}%)")
 
 # Save summary
-summary_file = output_dir / "summary_report.json"
+summary_file = output_dir / f"summary_report_{output_suffix}.json"
 with open(summary_file, 'w') as f:
     json.dump({
+        "classifier_name": classifier_name,
+        "classifier_type": output_suffix.replace("_classified", ""),
         "total_files": len(results_files),
         "total_turns": total_turns,
         "category_totals": dict(category_totals),
