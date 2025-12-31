@@ -224,10 +224,19 @@ def generate_yaml_config(
         }),
     }
 
-    # Write YAML config
+    # Custom representer to use literal block scalar (|) for prompts
+    def str_representer(dumper, data):
+        if len(data.splitlines()) > 1 or '\n' in data:
+            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+
+    # Write YAML config with custom formatting for multi-line strings
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
+        yaml.add_representer(str, str_representer)
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        # Reset representer to avoid affecting other yaml dumps
+        yaml.add_representer(str, yaml.representer.SafeRepresenter.represent_str)
 
 
 def launch_container(
