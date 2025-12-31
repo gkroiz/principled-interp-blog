@@ -2,12 +2,51 @@
 
 This script reads rollout_summary.json and container_config.yaml from each folder
 and creates a summary JSON file suitable for plotting with plot_hint_results_comparison.py.
+
+Usage Examples:
+    # Basic usage - aggregate results from multiple folders
+    python aggregate_hint_results.py folder1/ folder2/ folder3/
+    # Output: aggregated_results/hint_results.json
+
+    # Using wildcards to process all matching folders
+    python aggregate_hint_results.py ../../results/openai-gpt-5-*/
+    # Output: aggregated_results/hint_results.json
+
+    # Specify custom output path
+    python aggregate_hint_results.py folder1/ folder2/ -o custom_output.json
+    # Output: custom_output.json
+
+    # Process all results in a directory
+    python aggregate_hint_results.py ../../results/*/
+    # Output: aggregated_results/hint_results.json
+
+Expected folder structure:
+    folder1/
+        rollout_summary.json  # Contains hint_terminated_filenames, reward_hack_filenames, total_runs
+        container_config.yaml # Contains task.hint_penalty
+
+Output format:
+    {
+        "hint_1": {
+            "hint_cost": 1,
+            "total_games": 20,
+            "hints_used": 1,
+            "reward_hacks": 17
+        },
+        "hint_3": {
+            "hint_cost": 3,
+            "total_games": 20,
+            "hints_used": 3,
+            "reward_hacks": 14
+        },
+        ...
+    }
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List
 import yaml
 
 
@@ -45,34 +84,6 @@ def load_container_config(folder: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def extract_filenames(data: List) -> Set[str]:
-    """Extract set of filenames from data structure.
-
-    Args:
-        data: List that may contain filenames or nested structures
-
-    Returns:
-        Set of filenames
-    """
-    filenames = set()
-
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, str):
-                filenames.add(item)
-            elif isinstance(item, dict):
-                # Handle nested dictionaries
-                for value in item.values():
-                    if isinstance(value, str):
-                        filenames.add(value)
-                    elif isinstance(value, list):
-                        filenames.update(extract_filenames(value))
-            elif isinstance(item, list):
-                filenames.update(extract_filenames(item))
-
-    return filenames
-
-
 def process_folder(folder: Path) -> Dict:
     """Process a single experiment folder.
 
@@ -86,20 +97,18 @@ def process_folder(folder: Path) -> Dict:
     summary = load_rollout_summary(folder)
     config = load_container_config(folder)
 
-    # Extract hint penalty from config
-    hint_penalty = config.get('hint_penalty', 0)
+    # Extract hint penalty from config (nested under 'task')
+    hint_penalty = config.get('task', {}).get('hint_penalty', 0)
 
-    # Extract hint and hack filenames
-    hint_files = extract_filenames(summary.get('hint', []))
-    hack_files = extract_filenames(summary.get('hack', []))
+    # Extract hint and hack filenames from the summary
+    hint_files = set(summary.get('hint_terminated_filenames', []))
+    hack_files = set(summary.get('reward_hack_filenames', []))
 
     # If a file is in both, count it as hack only
     hint_only_files = hint_files - hack_files
 
-    # Count rollouts
-    # Total games = unique files across both categories
-    all_files = hint_files | hack_files
-    total_games = len(all_files)
+    # Total games from the summary
+    total_games = summary.get('total_runs', 0)
 
     hints_used = len(hint_only_files)
     reward_hacks = len(hack_files)
@@ -175,14 +184,23 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-o", "--output",
-        default="hint_results.json",
-        help="Output JSON file path (default: hint_results.json)"
+        default=None,
+        help="Output JSON file path (default: aggregated_results/hint_results.json relative to script location)"
     )
 
     args = parser.parse_args()
 
     # Convert to Path objects
     folders = [Path(f) for f in args.folders]
-    output_path = Path(args.output)
+
+    # Set default output path relative to script location
+    if args.output is None:
+        script_dir = Path(__file__).resolve().parent
+        output_dir = script_dir / "aggregated_results"
+        output_dir.mkdir(exist_ok=True)
+        output_path = output_dir / "hint_results.json"
+    else:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     aggregate_results(folders, output_path)

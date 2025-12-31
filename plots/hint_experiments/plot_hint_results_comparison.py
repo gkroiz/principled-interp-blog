@@ -1,6 +1,54 @@
 """Plotting script for comparing multiple hint results JSON files.
 
 Similar to plot_hint_results.py but plots multiple results as lines on one plot.
+
+Usage Examples:
+    # Compare multiple result files (uses filenames as labels)
+    python plot_hint_results_comparison.py result1.json result2.json result3.json
+    # Output: plots/main_hint_usage_comparison.png, main_reward_hacking_comparison.png, main_hint_ratio_comparison.png
+
+    # Compare with custom title prefix
+    python plot_hint_results_comparison.py gpt5.json claude.json --title-prefix "GPT-5 vs Claude"
+    # Output: plots/main_hint_usage_comparison.png (with title "Hint Usage Rate for GPT-5 vs Claude")
+
+    # Compare with custom file prefix for outputs
+    python plot_hint_results_comparison.py exp1.json exp2.json --file-prefix "experiment_comparison"
+    # Output: plots/experiment_comparison_hint_usage_comparison.png, etc.
+
+    # Combine all plots into a single figure with subplots
+    python plot_hint_results_comparison.py result1.json result2.json --combine-plots
+    # Output: plots/main_combined_comparison.png (single figure with 3 subplots)
+
+    # Full example with all options
+    python plot_hint_results_comparison.py \
+        aggregated_results/gpt5_hint_results.json \
+        aggregated_results/claude_hint_results.json \
+        --title-prefix "Model Comparison" \
+        --file-prefix "gpt5_vs_claude" \
+        --combine-plots
+    # Output: plots/gpt5_vs_claude_combined_comparison.png
+
+Input format (each JSON file):
+    {
+        "hint_1": {
+            "hint_cost": 1,
+            "total_games": 20,
+            "hints_used": 1,
+            "reward_hacks": 17
+        },
+        "hint_3": {
+            "hint_cost": 3,
+            "total_games": 20,
+            "hints_used": 3,
+            "reward_hacks": 14
+        },
+        ...
+    }
+
+Plots generated:
+    1. Hint Usage Rate: % of runs that chose hints vs hint cost
+    2. Reward Hacking Rate: % of runs that chose reward hacking vs hint cost
+    3. Hint-Hack Ratio: % of problematic behaviors that were hint usage (vs reward hacking)
 """
 
 import argparse
