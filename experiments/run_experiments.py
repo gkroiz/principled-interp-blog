@@ -966,7 +966,7 @@ def run_experiments(
         for result in successful_results:
             game_param = result.get("game", "tictactoe")
             commands.append(
-                f"python analysis/judge/grade_rollouts.py --output_dir={result['output_dir']} --game={game_param}"
+                f"python analysis/grading/grade_rollouts.py --output_dir={result['output_dir']} --game={game_param}"
             )
 
         combined_command = " && \\\n".join(commands)
