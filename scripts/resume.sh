@@ -9,8 +9,9 @@
 #   --count N     Run N parallel rollouts (default: 1)
 #   --local       Use local Docker image instead of Dockerhub
 #   --build       Build the local image before running (requires --local)
+#   --config PATH Override config file path (default: auto-discovered from grandparent)
 #
-# Config is auto-discovered from the step directory's grandparent.
+# Config is auto-discovered from the step directory's grandparent unless --config is provided.
 # Results are saved to: <step-dir>/<timestamp>/run-N/
 
 GREEN='\033[0;32m'
@@ -108,14 +109,8 @@ if [[ ! -d "$STEP_DIR" ]]; then
   exit 1
 fi
 
-# Config is in the grandparent directory (step-dir/../../config.yaml)
-CONFIG="$(dirname "$(dirname "$STEP_DIR")")/config.yaml"
-if [[ ! -f "$CONFIG" ]]; then
-  echo "Error: Config file not found at '$CONFIG'"
-  exit 1
-fi
-
 COUNT=1
+CONFIG_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --local)
@@ -130,12 +125,29 @@ while [[ $# -gt 0 ]]; do
       COUNT=$2
       shift 2
       ;;
+    --config)
+      CONFIG_OVERRIDE=$(realpath "$2")
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
       ;;
   esac
 done
+
+# Config: use override if provided, otherwise auto-discover from grandparent
+if [[ -n "$CONFIG_OVERRIDE" ]]; then
+  CONFIG="$CONFIG_OVERRIDE"
+else
+  CONFIG="$(dirname "$(dirname "$STEP_DIR")")/config.yaml"
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "Error: Config file not found at '$CONFIG'"
+  echo "Use --config to specify the config file path."
+  exit 1
+fi
 
 ENVIRONMENT=$(get_config_value "environment")
 MODEL=$(get_config_value "agent.model" | tr '/' '-')
