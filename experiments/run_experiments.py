@@ -10,7 +10,7 @@ This script automates the loop of:
 Usage:
     python run_experiments.py --config experiment_config.json
     python run_experiments.py --config experiment_config.json --experiments experiment1 experiment2
-    python run_experiments.py --config experiment_config.json --initial-state states/ctfish-0003.json
+    python run_experiments.py --config experiment_config.json --initial-state results/.../run-1/step-5
 
 Container Sources:
     Configure in docker_config section of your config file:
@@ -28,11 +28,16 @@ Container Sources:
         }
 
 State Resumption:
-    The --initial-state flag allows resuming experiments from a saved state file.
+    The --initial-state flag allows resuming experiments from a saved checkpoint directory.
+    A checkpoint directory is a step folder (e.g., step-5/) containing:
+    - state.json: Step counter and game results
+    - messages.json: Full conversation history
+    - game/: Game state files (board.txt, moves.txt, status.txt)
+
     This can be specified:
-    1. Via command line: --initial-state=path/to/state.json (overrides config)
-    2. In default_config: {"default_config": {"initial_state": "path/to/state.json"}}
-    3. Per experiment: {"experiments": [{"name": "exp1", "initial_state": "path/to/state.json"}]}
+    1. Via command line: --initial-state=results/.../run-1/step-5 (overrides config)
+    2. In default_config: {"default_config": {"initial_state": "path/to/step-dir"}}
+    3. Per experiment: {"experiments": [{"name": "exp1", "initial_state": "path/to/step-dir"}]}
 
     Priority: CLI flag > per-experiment config > default_config
 """
@@ -256,7 +261,8 @@ def launch_container(
         env_vars: Dictionary of environment variables to pass to container
         config_file: Path to YAML config file to mount at /opt/config.yaml (optional)
         state_dir: Directory to mount for state saving (optional)
-        initial_state: Path to initial state file for resumption (optional)
+        initial_state: Path to checkpoint directory for resumption (optional).
+            Must be a step directory containing state.json, messages.json, and game/.
 
     Returns:
         Popen process object
@@ -304,16 +310,12 @@ def launch_container(
             "-v", f"{state_dir.absolute()}:/tmp/output"
         ])
 
-        if initial_state:
-            # Mount initial state file
-            initial_state_path = Path(initial_state).absolute()
-            initial_state_dir = initial_state_path.parent
-            initial_state_basename = initial_state_path.name
-
-            docker_args.extend([
-                "-v", f"{initial_state_dir}:/tmp/initial-state:ro",
-                "-e", f"RESUME_FROM=/tmp/initial-state/{initial_state_basename}"
-            ])
+    # Mount checkpoint directory for resumption
+    if initial_state:
+        checkpoint_dir = Path(initial_state).absolute()
+        docker_args.extend([
+            "-v", f"{checkpoint_dir}:/opt/checkpoint:ro"
+        ])
 
     # Add image tag
     docker_args.append(image_tag)
@@ -368,7 +370,7 @@ def run_experiment_replicas(
         description: Description of the experiment (for saving config)
         full_config: Full experiment configuration (for saving config)
         base_dir: Base directory for storing experiment outputs (default: results)
-        initial_state: Path to state file to resume from (optional)
+        initial_state: Path to checkpoint directory for resumption (optional)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
         experiment: Full experiment dict for YAML config generation (optional)
         default_config: Default configuration for YAML config generation (optional)
@@ -381,12 +383,19 @@ def run_experiment_replicas(
     if game_config is None:
         game_config = {}
 
-    # Validate initial state file if provided
+    # Validate checkpoint directory if provided
     if initial_state:
-        initial_state_path = Path(initial_state)
-        if not initial_state_path.exists():
-            raise ValueError(f"Initial state file not found: {initial_state}")
-        log(f"Resuming from state file: {initial_state}", "INFO")
+        checkpoint_path = Path(initial_state)
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint directory not found: {initial_state}")
+        if not checkpoint_path.is_dir():
+            raise ValueError(f"Checkpoint must be a directory (step folder), not a file: {initial_state}")
+        # Validate required files exist
+        required_files = ["state.json", "messages.json"]
+        for req_file in required_files:
+            if not (checkpoint_path / req_file).exists():
+                raise ValueError(f"Checkpoint directory missing required file: {req_file}")
+        log(f"Resuming from checkpoint: {initial_state}", "INFO")
 
     # Set up output directory and config files
     output_dir, config_file, model_name, timestamp = setup_experiment_output(
@@ -401,6 +410,7 @@ def run_experiment_replicas(
         experiment=experiment,
         default_config=default_config,
         game_config=game_config,
+        environment=game,  # Use game type as environment for directory structure
     )
 
     # Launch containers
@@ -409,21 +419,19 @@ def run_experiment_replicas(
 
     log(f"\nLaunching {num_replicas} containers...", "INFO")
     for i in range(1, num_replicas + 1):
-        run_id = f"{model_name}-{timestamp}-run{i}"
-        output_file = output_dir / f"run-{run_id}.txt"
-        state_dir = output_dir / f"state-run{i}"
+        # run-N folder contains both rollout.log and step-M/ state directories
+        run_dir = output_dir / f"run-{i}"
+        output_file = run_dir / "rollout.log"
 
         log(f"[{i}/{num_replicas}] Launching container {i}...", "INFO")
         log(f"    Output: {output_file}", "INFO")
-        if initial_state or True:  # Always enable state saving
-            log(f"    State: {state_dir}", "INFO")
 
         process = launch_container(
             image_tag=image_tag,
             output_file=output_file,
             env_vars={},  # API keys come from .env, config comes from YAML
             config_file=config_file,  # Mount YAML config for agent-interp-envs
-            state_dir=state_dir,
+            state_dir=run_dir,  # State saved in same run-N folder
             initial_state=initial_state,
         )
         processes.append(process)
@@ -475,9 +483,9 @@ def save_experiment_config(
         "game_config": config.get("game_config", {}),
     }
 
-    # Add initial_state if provided
+    # Add checkpoint directory if provided
     if initial_state:
-        exp_config["experiment"]["initial_state_file"] = initial_state
+        exp_config["experiment"]["checkpoint_dir"] = initial_state
 
     config_file = Path(output_dir) / "experiment_config.json"
     with open(config_file, "w") as f:
@@ -498,6 +506,7 @@ def setup_experiment_output(
     experiment: dict,
     default_config: dict,
     game_config: dict,
+    environment: str = "tictactoe",
 ) -> tuple[Path, Path | None, str, str]:
     """
     Set up output directory and configuration files for an experiment
@@ -510,18 +519,20 @@ def setup_experiment_output(
         user_prompt: User prompt
         description: Experiment description
         full_config: Full experiment configuration
-        initial_state: Path to state file to resume from (optional)
+        initial_state: Path to checkpoint directory for resumption (optional)
         experiment: Full experiment dict for YAML config generation
         default_config: Default configuration for YAML config generation
         game_config: Game configuration
+        environment: Environment name (e.g., 'tictactoe', 'chess')
 
     Returns:
         Tuple of (output_dir, config_file, model_name, timestamp)
     """
     # Create output directory with timestamp
+    # Format: results/<environment>/<model>/<timestamp>/
     model_name = model.replace("/", "-").replace(":", "-")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = Path(base_dir) / f"{model_name}-{timestamp}"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = Path(base_dir) / environment / model_name / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"Output directory: {output_dir}", "SUCCESS")
@@ -542,7 +553,7 @@ def setup_experiment_output(
     # Generate YAML config file for agent-interp-envs containers
     config_file = None
     if experiment is not None and default_config is not None:
-        config_file = output_dir / "container_config.yaml"
+        config_file = output_dir / "config.yaml"
         log(f"Generating YAML config: {config_file}", "INFO")
 
         # Prepare experiment dict with prompts
@@ -639,15 +650,15 @@ def create_experiment_summary(
         num_replicas: Number of replicas run
         max_steps: Maximum steps per run
         image_tag: Docker image tag used
-        initial_state: Path to initial state file (optional)
+        initial_state: Path to checkpoint directory for resumption (optional)
         game: Game type
         start_time: Experiment start time
         elapsed: Total elapsed time in seconds
     """
     elapsed_fmt = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
 
-    log(f"Output files: {output_dir}/run-*.txt", "INFO")
-    log(f"State directories: {output_dir}/state-run*/", "INFO")
+    log(f"Run directories: {output_dir}/run-*/", "INFO")
+    log(f"Rollout logs: {output_dir}/run-*/rollout.log", "INFO")
 
     # Create summary JSON
     summary_file = output_dir / "experiment_summary.json"
@@ -659,7 +670,7 @@ def create_experiment_summary(
             "max_steps": max_steps,
             "docker_image_tag": image_tag,
             "save_state_enabled": True,
-            "initial_state_file": initial_state if initial_state else None,
+            "checkpoint_dir": initial_state if initial_state else None,
             "game": game,
         },
         "execution": {
@@ -675,8 +686,8 @@ def create_experiment_summary(
         },
         "outputs": {
             "output_directory": str(output_dir),
-            "log_files_pattern": f"run-{model_name}-{timestamp}-run*.txt",
-            "state_directories_pattern": "state-run*/",
+            "log_files_pattern": "run-*/rollout.log",
+            "run_directories_pattern": "run-*/",
         },
     }
 
@@ -704,7 +715,7 @@ def execute_single_experiment(
         exp_num: Experiment number (for logging)
         docker_tag: Docker image tag to use
         config: Full configuration dict
-        initial_state: Path to state file to resume from (optional)
+        initial_state: Path to checkpoint directory for resumption (optional)
         base_dir: Base directory for storing experiment outputs
         game: Game type ('chess' or 'tictactoe')
         results_queue: Queue to put results in
@@ -823,7 +834,7 @@ def run_experiments(
         experiments: List of experiment names to run (runs all if None)
         skip_build: Skip Docker build step (useful for testing)
         base_dir: Base directory for storing experiment outputs (default: results)
-        initial_state: Path to state file to resume from (optional, overrides config)
+        initial_state: Path to checkpoint directory for resumption (optional, overrides config)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
     """
     log("=" * 80, "SUCCESS")
@@ -991,7 +1002,7 @@ def main(
         experiments: Comma-separated list of experiment names to run (runs all if not specified)
         skip_build: Skip Docker build step (useful for testing)
         base_dir: Base directory for storing experiment outputs (default: results)
-        initial_state: Path to state file to resume from (optional, overrides config)
+        initial_state: Path to checkpoint directory for resumption (optional, overrides config)
         game: Game type ('chess' or 'tictactoe', default: tictactoe)
     """
     print(f"Running experiments: {experiments}")
