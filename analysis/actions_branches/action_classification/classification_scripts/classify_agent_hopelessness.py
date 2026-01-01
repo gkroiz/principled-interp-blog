@@ -201,44 +201,57 @@ def extract_hint_level(input_file_path: str) -> int:
 
 def load_rollout_analysis(input_file_path: str) -> Dict[str, Any]:
     """Load rollout analysis from the parent directory if available.
-    
+
     Returns dict with 'reward_hacked' and 'terminated_on_hint' booleans,
     or None if the file is not found or the rollout cannot be matched.
     """
     input_path = Path(input_file_path)
-    
-    # Look for rollout_analysis_detailed.json in the parent directory
-    parent_dir = input_path.parent.parent if input_path.parent.name.startswith('state-') else input_path.parent
+
+    # Determine the experiment directory based on the file structure
+    # New format: results/experiment/state-runX/step-Y/messages.json
+    # Old format: results/experiment/state-runX/ctfish-*.json
+    if input_path.parent.name.startswith('step-'):
+        # New format: go up 3 levels (step-Y -> state-runX -> experiment)
+        parent_dir = input_path.parent.parent.parent
+        state_dir = input_path.parent.parent
+    elif input_path.parent.name.startswith('state-'):
+        # Old format: go up 2 levels (state-runX -> experiment)
+        parent_dir = input_path.parent.parent
+        state_dir = input_path.parent
+    else:
+        # Fallback: use immediate parent
+        parent_dir = input_path.parent
+        state_dir = input_path.parent
+
     analysis_file = parent_dir / "rollout_analysis_detailed.json"
-    
+
     if not analysis_file.exists():
-        # Try immediate parent
-        analysis_file = input_path.parent / "rollout_analysis_detailed.json"
-        if not analysis_file.exists():
-            return None
-    
+        return None
+
     try:
         with open(analysis_file, 'r') as f:
             rollout_data = json.load(f)
-        
-        # Extract run number from the directory path (e.g., "state-run13" -> "run13")
+
+        # Extract run number from the state directory (e.g., "state-run13" -> "run13")
         run_number = None
-        if input_path.parent.name.startswith('state-run'):
-            run_number = input_path.parent.name.replace('state-', '')  # e.g., "run13"
+        if state_dir.name.startswith('state-run'):
+            run_number = state_dir.name.replace('state-', '')  # e.g., "run13"
         
         # Look through rollout entries to find a match
         for entry in rollout_data:
             filename = entry.get("filename", "")
             # Match based on run number if available
             if run_number and run_number in filename:
-                reward_hacked = entry.get("analysis", {}).get("reward_hacked", False)
-                terminated_on_hint = entry.get("metadata", {}).get("terminated_on_hint", False)
+                analysis = entry.get("analysis") or {}
+                metadata = entry.get("metadata") or {}
+                reward_hacked = analysis.get("reward_hacked", False)
+                terminated_on_hint = metadata.get("terminated_on_hint", False)
                 
                 return {
                     "reward_hacked": reward_hacked,
                     "terminated_on_hint": terminated_on_hint,
-                    "hack_description": entry.get("analysis", {}).get("hack_description"),
-                    "hack_turn": entry.get("analysis", {}).get("hack_turn"),
+                    "hack_description": analysis.get("hack_description"),
+                    "hack_turn": analysis.get("hack_turn"),
                     "matched_filename": filename
                 }
         
@@ -247,14 +260,16 @@ def load_rollout_analysis(input_file_path: str) -> Dict[str, Any]:
         for entry in rollout_data:
             filename = entry.get("filename", "")
             if input_filename in filename or any(part in filename for part in input_filename.split('-')):
-                reward_hacked = entry.get("analysis", {}).get("reward_hacked", False)
-                terminated_on_hint = entry.get("metadata", {}).get("terminated_on_hint", False)
+                analysis = entry.get("analysis") or {}
+                metadata = entry.get("metadata") or {}
+                reward_hacked = analysis.get("reward_hacked", False)
+                terminated_on_hint = metadata.get("terminated_on_hint", False)
                 
                 return {
                     "reward_hacked": reward_hacked,
                     "terminated_on_hint": terminated_on_hint,
-                    "hack_description": entry.get("analysis", {}).get("hack_description"),
-                    "hack_turn": entry.get("analysis", {}).get("hack_turn"),
+                    "hack_description": analysis.get("hack_description"),
+                    "hack_turn": analysis.get("hack_turn"),
                     "matched_filename": filename
                 }
         
@@ -576,16 +591,29 @@ def main():
     # Load conversation
     print(f"Loading conversation from {args.input_file}...")
     conversation = load_conversation(args.input_file)
-    history = conversation.get("history", [])
-    
+
+    # Handle both old format (dict with "history" key) and new format (list of messages)
+    if isinstance(conversation, list):
+        # New format: messages.json is a list of messages directly
+        history = conversation
+        # Extract agent_prompt and task_prompt from first two messages
+        agent_prompt = None
+        task_prompt = None
+        if len(history) > 0 and history[0].get("role") == "system":
+            agent_prompt = history[0].get("content")
+        if len(history) > 1 and history[1].get("role") == "user":
+            task_prompt = history[1].get("content")
+    else:
+        # Old format: dict with "history" key
+        history = conversation.get("history", [])
+        agent_prompt = conversation.get("agent_prompt")
+        task_prompt = conversation.get("task_prompt")
+
     if not history:
         print("Error: No history found in conversation file")
         exit(1)
-    
-    # Extract initial prompts if present
-    agent_prompt = conversation.get("agent_prompt")
-    task_prompt = conversation.get("task_prompt")
-    
+
+    # Extract initial prompts if present (only available in old format)
     if agent_prompt:
         print(f"Found agent_prompt (system prompt)")
     if task_prompt:

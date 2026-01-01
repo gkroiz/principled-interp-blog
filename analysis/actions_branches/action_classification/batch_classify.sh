@@ -1,12 +1,12 @@
 #!/bin/bash
 # Batch classify conversation state files (PARALLELIZED)
-# Only processes the final (highest-numbered) state file from each run directory
+# Only processes the final step directory's messages.json from each run directory
 
 set -e
 
 # Default values
 INPUT_DIR=""
-OUTPUT_DIR="./thought_anchors/classifications"
+OUTPUT_DIR="./analysis/action_branches/action_classifcation/classifications"
 MODEL="google/gemini-2.5-pro"
 PARALLEL_JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 CLASSIFIER_TYPE="standard"
@@ -35,18 +35,18 @@ usage() {
     echo "  objective        : Uses classify_agent_objective_interpretation.py (how agent interprets objective)"
     echo ""
     echo "Examples:"
-    echo "  $0 --directory continued_reasoning_results/2_games/"
-    echo "  $0 -d continued_reasoning_results/2_games/ -o ./classifications/"
-    echo "  $0 -d continued_reasoning_results/2_games/ -m google/gemini-2.5-pro -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t exploits -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t exploration -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t hopelessness -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t fairness -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t misunderstandings -j 8"
-    echo "  $0 -d continued_reasoning_results/2_games/ -t objective -j 8"
+    echo "  $0 --directory results/"
+    echo "  $0 -d results/ -o ./classifications/"
+    echo "  $0 -d results/ -m google/gemini-2.5-pro -j 8"
+    echo "  $0 -d results/ -t exploits -j 8"
+    echo "  $0 -d results/ -t exploration -j 8"
+    echo "  $0 -d results/ -t hopelessness -j 8"
+    echo "  $0 -d results/ -t fairness -j 8"
+    echo "  $0 -d results/ -t misunderstandings -j 8"
+    echo "  $0 -d results/ -t objective -j 8"
     echo ""
-    echo "Note: For each state-runXX directory, only the final state file is processed"
-    echo "      (since each state file contains cumulative history)"
+    echo "Note: For each state-runXX directory, only the final step directory is processed"
+    echo "      (the highest numbered step-* directory's messages.json file)"
     exit 1
 }
 
@@ -177,15 +177,18 @@ if [ -z "$STATE_DIRS" ]; then
     exit 1
 fi
 
-# For each state-run directory, find the highest-numbered state file
+# For each state-run directory, find the highest-numbered step directory and its messages.json
 FILES=""
 DIR_COUNT=0
 for state_dir in $STATE_DIRS; do
     DIR_COUNT=$((DIR_COUNT + 1))
-    # Find the highest numbered ctfish-*.json file
-    LAST_FILE=$(ls "$state_dir"/ctfish-*.json 2>/dev/null | sort -V | tail -1)
-    if [ -n "$LAST_FILE" ]; then
-        FILES="$FILES$LAST_FILE"$'\n'
+    # Find the highest numbered step-* directory
+    LAST_STEP_DIR=$(find "$state_dir" -maxdepth 1 -type d -name "step-*" 2>/dev/null | sort -V | tail -1)
+    if [ -n "$LAST_STEP_DIR" ]; then
+        MESSAGES_FILE="$LAST_STEP_DIR/messages.json"
+        if [ -f "$MESSAGES_FILE" ]; then
+            FILES="$FILES$MESSAGES_FILE"$'\n'
+        fi
     fi
 done
 
@@ -193,7 +196,7 @@ done
 FILES=$(echo "$FILES" | sed '/^$/d')
 
 if [ -z "$FILES" ]; then
-    echo "No ctfish-*.json files found in state-run directories"
+    echo "No messages.json files found in step-* directories"
     exit 1
 fi
 
@@ -224,15 +227,15 @@ process_file() {
     local classifier_script="$8"
     local output_suffix="$9"
     
-    # Extract state-run directory name, experiment directory name, and file basename
-    local STATE_DIR=$(basename $(dirname "$file"))
-    local EXPERIMENT_DIR=$(basename $(dirname $(dirname "$file")))
-    local FILE_BASENAME=$(basename "$file" .json)
-    
+    # Extract step directory name, state-run directory name, and experiment directory name
+    local STEP_DIR=$(basename $(dirname "$file"))
+    local STATE_DIR=$(basename $(dirname $(dirname "$file")))
+    local EXPERIMENT_DIR=$(basename $(dirname $(dirname $(dirname "$file"))))
+
     # Generate output filename with experiment directory to avoid collisions
-    local OUTPUT_FILE="$output_dir/${EXPERIMENT_DIR}_${STATE_DIR}_${FILE_BASENAME}_${output_suffix}.json"
-    
-    echo "[$current/$total] Processing: $EXPERIMENT_DIR/$STATE_DIR/$FILE_BASENAME" >> "$log_file"
+    local OUTPUT_FILE="$output_dir/${EXPERIMENT_DIR}_${STATE_DIR}_${STEP_DIR}_${output_suffix}.json"
+
+    echo "[$current/$total] Processing: $EXPERIMENT_DIR/$STATE_DIR/$STEP_DIR" >> "$log_file"
     
     # Skip if output already exists
     if [ -f "$OUTPUT_FILE" ]; then
