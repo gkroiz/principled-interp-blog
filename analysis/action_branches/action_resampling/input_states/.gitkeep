@@ -1,5 +1,0 @@
-# This directory should contain state-run folders
-# 
-# Copy state folders from your experiments like this:
-# cp -r ../o3_hint_rollouts/.../state-run5/step-2 turn_anchors/input_states/
-

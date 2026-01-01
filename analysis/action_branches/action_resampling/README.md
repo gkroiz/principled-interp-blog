@@ -1,191 +1,150 @@
-# Turn Anchors Analysis
+# Action Resampling Analysis
 
-Automated turn-by-turn analysis system that resamples from each state in a run and computes the `hint/(hint+hack)` metric.
+Computes causal attribution of agent actions by resampling from each checkpoint in a run and measuring the `hint/(hint+hack)` metric.
 
-## Directory Structure
+## Overview
 
-```
-turn_anchors/
-├── config.py                    # Configuration (edit this!)
-├── generate_all_anchors.py      # Generate rollouts from each turn
-├── compute_anchor_metrics.py    # Grade rollouts and compute metrics
-├── visualize_anchors.py         # Create visualization
-│
-├── input_states/                # Put state-run folders here
-│   └── state-run5/
-│       ├── ctfish-tictactoe-0000.json
-│       ├── ctfish-tictactoe-0001.json
-│       └── ...
-│
-├── rollouts/                    # Generated rollouts (auto-created)
-│   └── run5/
-│       ├── step_00/
-│       ├── step_01/
-│       └── ...
-│
-├── analysis/                    # Grading results (auto-created)
-│   └── run5/
-│       ├── step_00/
-│       │   └── metric_result.json
-│       └── ...
-│
-└── summary/                     # Final results (auto-created)
-    ├── run5_metrics.json
-    └── run5_plot.png
-```
+Given a completed run with step checkpoints, this pipeline:
+1. **Resamples** N rollouts from each step checkpoint using `resume.sh`
+2. **Grades** each resampled rollout using `grade_rollouts.py`
+3. **Plots** the metric across steps to visualize causal effects
 
 ## Usage
 
-### 1. Setup
-
-Copy a state-run folder from your experiments:
+### Quick Start (Single Command)
 
 ```bash
-# Copy state folder
-cp -r ../o3_hint_rollouts/o3-2025-04-16-20251030-105921/state-run5 turn_anchors/input_states/
+# Run full pipeline on a completed run
+uv run python analysis/action_branches/action_resampling/run_anchor_analysis.py \
+    results/tictactoe/claude-haiku-4-5/2025-12-31_18-28-38/run-1 \
+    --count 20
+
+# With options
+uv run python analysis/action_branches/action_resampling/run_anchor_analysis.py \
+    results/.../run-1 \
+    --count 20 \
+    --local \
+    --max-parallel 4
 ```
 
-### 2. Configure
+### Options
 
-Edit `config.py` and update these settings:
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--count N` | Number of rollouts per step | 10 |
+| `--local` | Use local Docker image | False |
+| `--max-parallel N` | Parallel resample jobs | 1 |
+| `--skip-resample` | Skip resampling step | False |
+| `--skip-grade` | Skip grading step | False |
+| `--game GAME` | Game type (auto-detected) | from config.yaml |
 
-```python
-# Which run to process
-RUN_TO_PROCESS = "state-run5"
-
-# CRITICAL: Match the original experiment's hint penalty!
-GAME_CONFIG = {
-    # ...
-    "hint_penalty": 1,  # Use the value from the original run
-}
-
-# Also update USER_PROMPT to match (e.g., "costs 1 points" or "costs 7 points")
-```
-
-### 3. Run the Pipeline
+### Running Steps Individually
 
 ```bash
-cd turn_anchors
+# 1. Resample only
+./scripts/resample.sh results/.../run-1 --count 20 --max-parallel 4
 
-# Step 1: Generate N rollouts from each turn (with parallelization)
-python3 generate_all_anchors.py
+# 2. Grade a specific resampled folder
+uv run python analysis/grading/grade_rollouts.py \
+    results/.../run-1/step-0/2025-12-31_22-00-00 \
+    --game tictactoe
 
-# Step 2: Grade rollouts and compute metrics
-python3 compute_anchor_metrics.py
-
-# Step 3: Visualize results
-python3 visualize_anchors.py
+# 3. Plot only (after resampling and grading)
+uv run python analysis/action_branches/action_resampling/plot_anchors.py \
+    results/.../run-1
 ```
 
-### Parallelization
+## Input Structure
 
-By default, `generate_all_anchors.py` processes **5 steps in parallel**. Each step internally runs N rollouts in parallel (via `run-parallel.sh`), so this gives you excellent throughput.
+Expects a run folder with step checkpoints from `run.sh` or `run_experiments.py`:
 
-To adjust parallelization, you can edit `config.py`:
-
-```python
-# In generate_all_anchors.py call
-python3 generate_all_anchors.py --max-parallel 10  # Process 10 steps at once
+```
+results/<env>/<model>/<timestamp>/
+├── config.yaml                    # Experiment config (game type auto-detected)
+├── rollout_analysis_detailed.json # Grading of original runs (baseline)
+├── run-1/
+│   ├── rollout.log
+│   ├── step-0/
+│   │   ├── state.json
+│   │   ├── messages.json
+│   │   └── game/
+│   ├── step-1/
+│   │   └── ...
+│   └── step-N/  (terminal state, excluded from resampling)
+└── run-2/
+    └── ...
 ```
 
-**Example with your setup (n=20 per step, 5 parallel steps):**
-- 5 steps running simultaneously
-- Each step runs 20 rollouts in parallel
-- Total: up to 100 Docker containers running at once
-- Much faster than sequential processing!
+## Output Structure
 
-## Output
+After running the pipeline:
 
-- **`rollouts/run5/step_XX/`**: Contains N rollouts generated from turn XX
-- **`analysis/run5/step_XX/metric_result.json`**: Contains hint count, hack count, and metric for turn XX
-- **`summary/run5_metrics.json`**: Aggregated metrics for all turns
-- **`summary/run5_plot.png`**: Visualization of metric vs turn number
-
-## Configuration Details
-
-### Critical Settings
-
-These MUST match the original experiment that generated the states:
-
-- `hint_penalty`: The actual hint cost in the game (1, 7, etc.)
-- `USER_PROMPT`: Should mention the correct hint cost
-- `SYSTEM_PROMPT`: Should match the original
-- `GAME_CONFIG`: All game parameters (win/draw/loss values, practice games, etc.)
-
-### Rollout Settings
-
-- `ROLLOUTS_PER_STEP`: How many rollouts to generate per turn (default: 50)
-- `MODEL`: Which model to use (default: "o3-2025-04-16")
-- `MAX_STEPS`: Maximum steps per rollout (default: 40)
-
-## Tips
-
-- **Resume**: Run `generate_all_anchors.py` again to continue if interrupted (uses `skip_existing=True`)
-- **Multiple runs**: Change `RUN_TO_PROCESS` in `config.py` and rerun
-- **Debug**: Check `rollouts/runX/step_XX/o3-2025-04-16-TIMESTAMP/` for individual rollout logs
-- **Verify config**: Always verify `hint_penalty` matches the original run before generating rollouts!
-- **Error logs**: If errors occur during generation, check `summary/runX_generation_errors_TIMESTAMP.log` for details
-- **Patch old rollouts**: If you have rollouts from before summary creation was added, run `python3 patch_create_summaries.py`
-
-### Patching Old Rollouts
-
-If you generated rollouts before the `rollouts_summary.json` creation logic was added, you can retroactively create the summary files:
-
-```bash
-# Patch rollouts for the configured run
-python3 patch_create_summaries.py
-
-# Or patch a specific run
-python3 patch_create_summaries.py --run-name run5
+```
+run-1/
+├── step-0/
+│   └── 2025-12-31_22-00-00/       # Resampled rollouts
+│       ├── run-1/rollout.log
+│       ├── run-2/rollout.log
+│       └── rollout_analysis_detailed.json
+├── step-1/
+│   └── 2025-12-31_22-01-00/
+│       └── ...
+├── anchor_metrics.json            # Aggregated metrics
+└── anchor_plot.png                # Visualization
 ```
 
-This will:
-- Find all `step_XX/` directories
-- Aggregate `run_metadata.json` files in each
-- Create `rollouts_summary.json` for each step
-- Skip steps that already have summaries
+## Metric Computation
 
-### Error Handling
+The metric is `hint / (hint + hack)` where:
+- **Hack takes precedence**: if a rollout both hacks AND hints, it counts as hack only
+- **Baseline**: Original runs from parent folder serve as "resampling from before action 0"
 
-The system automatically logs errors during rollout generation:
+### Plot Interpretation
 
-- **Rate limit errors**: Detected and flagged with `[RATE_LIMIT]` or `[RATE_LIMIT_429]`
-- **OpenAI API errors**: Detected and flagged with `[OPENAI_API_ERROR]`
-- **Server errors**: Detected and flagged with `[OPENAI_SERVER_ERROR]` (500, 502, 503)
-- **Error log location**: `summary/run5_generation_errors_TIMESTAMP.log`
+**Top panel (line plot):**
+- X-axis: "Resampling from before action N"
+  - x=0: baseline (original runs)
+  - x=1: resampling from step-0 (action 0 is fixed)
+  - x=N: resampling from step N-1 (actions 0 to N-1 are fixed)
+- Y-axis: hint/(hint+hack) metric (0 = all hacks, 1 = all hints)
 
-Example error log entry:
-```json
-{
-  "step": 5,
-  "state_file": "turn_anchors/input_states/state-run5/ctfish-tictactoe-0005.json",
-  "error": "[RATE_LIMIT] Rate limit exceeded. Please try again later.",
-  "timestamp": "2025-11-02T14:23:45.123456"
-}
-```
+**Bottom panel (bar chart):**
+- Causal effect of each action
+- Bar at action N = metric[N] - metric[N-1]
+- Green = action increased hint usage
+- Red = action increased hack usage
 
-If you encounter rate limits, you can:
-1. Wait a few minutes and rerun (it will skip completed steps)
-2. Reduce `MAX_PARALLEL_STEPS` to lower concurrency
-3. Reduce `ROLLOUTS_PER_STEP` to generate fewer rollouts per step
+## Files
+
+| File | Purpose |
+|------|---------|
+| `run_anchor_analysis.py` | Orchestrates the full pipeline |
+| `plot_anchors.py` | Computes metrics and creates visualization |
 
 ## Example Workflow
 
 ```bash
-# Analyze run5 (hint penalty = 1)
-cp -r ../o3_hint_rollouts/.../state-run5 turn_anchors/input_states/
-# Edit config.py: RUN_TO_PROCESS = "state-run5", hint_penalty = 1
-python3 generate_all_anchors.py
-python3 compute_anchor_metrics.py
-python3 visualize_anchors.py
+# 1. Run initial experiment
+uv run ./scripts/run.sh dev_config.yaml --count 5
 
-# Analyze run9 (hint penalty = 7)
-cp -r ../o3_hint_rollouts/.../state-run9 turn_anchors/input_states/
-# Edit config.py: RUN_TO_PROCESS = "state-run9", hint_penalty = 7, update USER_PROMPT
-python3 generate_all_anchors.py
-python3 compute_anchor_metrics.py
-python3 visualize_anchors.py
+# 2. Grade original runs
+uv run python analysis/grading/grade_rollouts.py \
+    results/tictactoe/claude-haiku-4-5/2025-12-31_18-28-38 \
+    --game tictactoe
+
+# 3. Run anchor analysis on one run
+uv run python analysis/action_branches/action_resampling/run_anchor_analysis.py \
+    results/tictactoe/claude-haiku-4-5/2025-12-31_18-28-38/run-1 \
+    --count 20 --local
+
+# 4. View results
+open results/.../run-1/anchor_plot.png
+cat results/.../run-1/anchor_metrics.json
 ```
 
-Now you have `summary/run5_plot.png` and `summary/run9_plot.png` for comparison!
+## Notes
 
+- The **last step** (terminal state) is automatically excluded from resampling since the game is already over
+- Game type is auto-detected from `config.yaml` in the parent directory
+- Use `--skip-resample` to re-grade and re-plot without regenerating rollouts
+- Use `--skip-grade` to just re-plot with existing grading results
