@@ -1,0 +1,7 @@
+__pycache__/
+.env
+results/
+state-*/
+
+plots/hint_experiments/aggregated_results
+plots/hint_experiments/plots
