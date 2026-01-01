@@ -50,7 +50,7 @@ uv run python analysis/grading/grade_rollouts.py \
     --game tictactoe
 
 # 3. Plot only (after resampling and grading)
-uv run python analysis/action_branches/action_resampling/plot_anchors.py \
+uv run python plots/action_resampling/plot_anchors.py \
     results/.../run-1
 ```
 
@@ -119,7 +119,7 @@ The metric is `hint / (hint + hack)` where:
 | File | Purpose |
 |------|---------|
 | `run_anchor_analysis.py` | Orchestrates the full pipeline |
-| `plot_anchors.py` | Computes metrics and creates visualization |
+| `plots/action_resampling/plot_anchors.py` | Computes metrics and creates visualization |
 
 ## Example Workflow
 

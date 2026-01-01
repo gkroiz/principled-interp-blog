@@ -167,20 +167,27 @@ def run_grading(run_folder: Path, game: str) -> bool:
 
 
 def run_plotting(run_folder: Path) -> bool:
-    """Run plot_anchors.py on the run folder."""
+    """Run plots/action_resampling/plot_anchors.py on the run folder."""
     print(f"\n{'='*70}")
     print("STEP 3: PLOTTING")
     print(f"{'='*70}\n")
     
-    # Import and run directly
-    from plot_anchors import main as plot_main
-    
-    try:
-        plot_main(str(run_folder))
-        return True
-    except Exception as e:
-        print(f"❌ Plotting failed: {e}")
+    repo_root = Path(__file__).parent.parent.parent.parent
+    plot_script = repo_root / "plots" / "action_resampling" / "plot_anchors.py"
+
+    if not plot_script.exists():
+        print(f"Error: plot_anchors.py not found at {plot_script}")
         return False
+
+    cmd = [sys.executable, str(plot_script), str(run_folder)]
+    print(f"Running: {' '.join(cmd)}\n")
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"\n❌ Plotting failed with exit code {result.returncode}")
+        return False
+
+    return True
 
 
 def main(
